@@ -495,13 +495,10 @@ func (s *Scanner) sendICMP(handle *pcap.Handle, srcMAC, dstMAC net.HardwareAddr,
 	handle.WritePacketData(buf.Bytes())
 }
 
-// Asynchronous Reverse DNS Lookup
+// Aggressive Multi-Protocol Hostname Lookup
+// Uses NetBIOS (UDP 137) → mDNS (UDP 5353) → HTTP Title Scraping (Port 80/443/8080)
 func (s *Scanner) lookupHostname(ip string) {
-	names, err := net.LookupAddr(ip)
-	hostname := "Unknown Name"
-	if err == nil && len(names) > 0 {
-		hostname = strings.TrimSuffix(names[0], ".")
-	}
+	hostname := GetAggressiveHostnameParallel(ip)
 
 	s.Results <- Device{
 		IP:       ip,
