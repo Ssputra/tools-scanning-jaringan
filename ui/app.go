@@ -26,18 +26,18 @@ const (
 
 // ── Scan Mode Constants (indices into modeLabels) ───────────────────
 const (
-	modeActiveOnly  = 0
-	modeHybrid      = 1
+	modeLocalLAN    = 0
+	modeExternal    = 1
 	modePassiveOnly = 2
 	modePortScanner = 3
 )
 
 // Mode menu labels
 var modeLabels = []string{
-	"[1] Active Scan Only        (Hanya ARP Broadcast, deteksi subnet otomatis)",
-	"[2] Hybrid Scan             (ARP Broadcast + Passive Sniffing, butuh IP valid)",
-	"[3] Pure Passive Sniffing   (Hanya mendengarkan kabel LAN, tidak peduli IP / beda subnet)",
-	"[4] Custom Port Scanner     (Input IP target manual, scan port populer)",
+	"[1] Local LAN Scan           (Layer 2 ARP, deteksi subnet otomatis di segmen yang sama)",
+	"[2] External / WAN Scan      (Layer 3 ICMP, lacak rute gateway & scan beda subnet)",
+	"[3] Pure Passive Sniffing    (Hanya mendengarkan kabel LAN, tidak peduli IP / beda subnet)",
+	"[4] Custom Port Scanner      (Input IP target manual, scan port populer)",
 }
 
 type model struct {
@@ -298,12 +298,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateSelectIface
 				m.cursor = 0
 				switch m.scanMode {
-				case modeActiveOnly:
-					m.logMessage = "Mode: Active Scan Only dipilih. Pilih interface jaringan..."
-				case modeHybrid:
-					m.logMessage = "Mode: Hybrid Scan dipilih. Pilih interface jaringan..."
+				case modeLocalLAN:
+					m.logMessage = "Local LAN Scan dipilih. Pilih interface jaringan..."
+				case modeExternal:
+					m.logMessage = "External / WAN Scan dipilih. Pilih interface jaringan..."
 				case modePassiveOnly:
-					m.logMessage = "Mode: Pure Passive Sniffing dipilih. Pilih interface jaringan..."
+					m.logMessage = "Pure Passive Sniffing dipilih. Pilih interface jaringan..."
 				}
 				return m, doInterfaceTick()
 
@@ -314,10 +314,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					var engineMode string
 					switch m.scanMode {
-					case modeActiveOnly:
+					case modeLocalLAN:
 						engineMode = scanner.ModeActiveOnly
-					case modeHybrid:
-						engineMode = scanner.ModeHybrid
+					case modeExternal:
+						engineMode = scanner.ModeExternal
 					case modePassiveOnly:
 						engineMode = scanner.ModePassiveOnly
 					}
@@ -326,14 +326,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					var err error
 					switch m.scanMode {
-					case modeActiveOnly:
-						m.logMessage = "Mode: Active Scan Only (ARP Broadcast saja) via " + selectedIface.Name + "..."
+					case modeLocalLAN:
+						m.logMessage = "Local LAN Scan (ARP Broadcast) via " + selectedIface.Name + "..."
 						err = m.scanner.StartActiveOnly()
-					case modeHybrid:
-						m.logMessage = "Mode: Hybrid Scan (ARP + Passive Sniffing) via " + selectedIface.Name + "..."
-						err = m.scanner.Start()
+					case modeExternal:
+						m.logMessage = "External / WAN Scan (ICMP TTL Trace) via " + selectedIface.Name + "..."
+						err = m.scanner.StartExternalScan(selectedIface.Name)
 					case modePassiveOnly:
-						m.logMessage = "Mode: Pure Passive Sniffing (Mendengarkan ocehan paket di kabel LAN) via " + selectedIface.Name + "..."
+						m.logMessage = "Pure Passive Sniffing (Mendengarkan ocehan paket di kabel LAN) via " + selectedIface.Name + "..."
 						err = m.scanner.StartPassive()
 					}
 					if err != nil {
@@ -469,10 +469,10 @@ func (m model) View() string {
 		var s strings.Builder
 		var modeTag string
 		switch m.scanMode {
-		case modeActiveOnly:
-			modeTag = "Active Scan Only"
-		case modeHybrid:
-			modeTag = "Hybrid Scan"
+		case modeLocalLAN:
+			modeTag = "Local LAN Scan"
+		case modeExternal:
+			modeTag = "External / WAN Scan"
 		case modePassiveOnly:
 			modeTag = "Pure Passive Sniffing"
 		}

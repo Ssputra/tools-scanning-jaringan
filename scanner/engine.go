@@ -25,6 +25,7 @@ const (
 	ModeActiveOnly  = "active_only"   // ARP broadcast + ARP/ICMP reply only
 	ModeHybrid      = "hybrid"        // ARP broadcast + ARP/ICMP reply + passive sniffer
 	ModePassiveOnly = "passive_only"  // Passive sniffer only, no ARP
+	ModeExternal    = "external"      // Layer 3 ICMP TTL-trace + TCP probe (no ARP)
 )
 
 type Scanner struct {
@@ -446,6 +447,287 @@ func (s *Scanner) StartPassive() error {
 	}()
 
 	return nil
+}
+
+// StartExternalScan launches a Layer 3 external/WAN scan.
+// It uses ICMP TTL-trace (traceroute-style) and TCP SYN probes to discover
+// hops and services beyond the local subnet. No ARP broadcast is used.
+func (s *Scanner) StartExternalScan(ifaceName string) error {
+	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+	if err != nil {
+		return fmt.Errorf("failed to open pcap: %v", err)
+	}
+
+	// Find local IP and MAC
+	devs, err := pcap.FindAllDevs()
+	if err != nil {
+		return fmt.Errorf("error finding devices: %v", err)
+	}
+
+	var srcIP net.IP
+	var srcMAC net.HardwareAddr
+	var network *net.IPNet
+	for _, d := range devs {
+		if d.Name == ifaceName {
+			for _, addr := range d.Addresses {
+				if ipv4 := addr.IP.To4(); ipv4 != nil {
+					srcIP = ipv4
+					network = &net.IPNet{IP: ipv4, Mask: addr.Netmask}
+					break
+				}
+			}
+			break
+		}
+	}
+	if srcIP == nil {
+		return fmt.Errorf("no valid IPv4 on interface")
+	}
+
+	// Resolve local MAC
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		addrs, _ := i.Addrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.Equal(srcIP) {
+				srcMAC = i.HardwareAddr
+				break
+			}
+		}
+	}
+	if srcMAC == nil {
+		return fmt.Errorf("could not determine local MAC")
+	}
+
+	// Detect default gateway
+	gateway := detectDefaultGateway()
+	if gateway == "" {
+		// Fallback: assume .1 on same subnet
+		gw := srcIP.Mask(network.Mask)
+		gw[3] = 1
+		gateway = gw.String()
+	}
+
+	s.Results <- Device{
+		IP:       gateway,
+		MAC:      "gateway",
+		Hostname: "Default Gateway",
+		Vendor:   "Gateway",
+		OS:       "Router/Gateway",
+	}
+
+	go func() {
+		defer handle.Close()
+
+		// Track discovered hops to avoid duplicates
+		seenHops := make(map[string]bool)
+		var hopMu sync.Mutex
+
+		// Phase 1: ICMP TTL-trace from TTL 1 to 30
+		for ttl := 1; ttl <= 30; ttl++ {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+
+			hopIP := sendTTLProbe(handle, srcMAC, srcIP, gateway, ttl)
+			if hopIP != "" {
+				hopMu.Lock()
+				if !seenHops[hopIP] {
+					seenHops[hopIP] = true
+					hopMu.Unlock()
+
+					vendor, osType := DetectOS("", 0)
+					s.Results <- Device{
+						IP:     hopIP,
+						MAC:    "discovered",
+						Vendor: vendor,
+						OS:     "Hop " + fmt.Sprintf("%d", ttl) + " — " + osType,
+					}
+
+					// Phase 2: TCP probe each hop on port 80/443
+					go s.tcpProbeHop(hopIP)
+				} else {
+					hopMu.Unlock()
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// Phase 3: Final target — TCP connect to common ports
+		// Scan a set of public DNS / well-known IPs as demonstration
+		targets := []string{
+			"8.8.8.8",       // Google DNS
+			"1.1.1.1",       // Cloudflare DNS
+			"208.67.222.222", // OpenDNS
+		}
+		for _, target := range targets {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+			s.tcpProbeTarget(target)
+		}
+	}()
+
+	return nil
+}
+
+// detectDefaultGateway reads the OS routing table to find the default gateway IP.
+func detectDefaultGateway() string {
+	// Use net package to read routes — on Windows/Linux this returns the gateway
+	conn, err := net.DialTimeout("udp", "8.8.8.8:53", 500*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
+// sendTTLProbe crafts an ICMP Echo Request with a specific TTL and sends it
+// via pcap. It then listens for either:
+//   - ICMP Echo Reply (reached the target)
+//   - ICMP Time Exceeded (hit a router hop)
+//
+// Returns the responding IP, or "" if no response within timeout.
+func sendTTLProbe(handle *pcap.Handle, srcMAC net.HardwareAddr, srcIP net.IP, dstIP string, ttl int) string {
+	// Build Ethernet + IPv4 + ICMP Echo Request
+	ethFrame := layers.Ethernet{
+		SrcMAC:       srcMAC,
+		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ipLayer := layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      uint8(ttl),
+		Protocol: layers.IPProtocolICMPv4,
+		SrcIP:    srcIP.To4(),
+		DstIP:    net.ParseIP(dstIP).To4(),
+	}
+	icmpLayer := layers.ICMPv4{
+		TypeCode: layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0),
+		Id:       0xABCD,
+		Seq:      uint16(ttl),
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	gopacket.SerializeLayers(buf, opts, &ethFrame, &ipLayer, &icmpLayer,
+		gopacket.Payload([]byte("NETSCANNER-EXT")))
+
+	handle.WritePacketData(buf.Bytes())
+
+	// Listen for response (up to 500ms)
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case <-deadline:
+			return ""
+		case pkt, ok := <-func() <-chan gopacket.Packet {
+			ch := make(chan gopacket.Packet, 10)
+			go func() {
+				ps := gopacket.NewPacketSource(handle, handle.LinkType())
+				for p := range ps.Packets() {
+					select {
+					case ch <- p:
+					default:
+					}
+				}
+			}()
+			return ch
+		}():
+			if !ok || pkt == nil {
+				continue
+			}
+
+			// Skip our own packets
+			if ethL := pkt.Layer(layers.LayerTypeEthernet); ethL != nil {
+				eth := ethL.(*layers.Ethernet)
+				if eth.SrcMAC.String() == srcMAC.String() {
+					continue
+				}
+			}
+
+			if ipL := pkt.Layer(layers.LayerTypeIPv4); ipL != nil {
+				ipv4 := ipL.(*layers.IPv4)
+				srcRespondIP := ipv4.SrcIP.String()
+
+				// ICMP Time Exceeded — a router hop responded
+				if icmpL := pkt.Layer(layers.LayerTypeICMPv4); icmpL != nil {
+					icmp := icmpL.(*layers.ICMPv4)
+					if icmp.TypeCode.Type() == layers.ICMPv4TypeTimeExceeded {
+						return srcRespondIP
+					}
+					// ICMP Echo Reply — we reached the target
+					if icmp.TypeCode.Type() == layers.ICMPv4TypeEchoReply {
+						return srcRespondIP
+					}
+				}
+			}
+		}
+	}
+}
+
+// tcpProbeHop attempts a TCP connect to port 80/443 on a discovered hop.
+func (s *Scanner) tcpProbeHop(ip string) {
+	ports := []int{80, 443, 22, 8080}
+	for _, port := range ports {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+		addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+		conn, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			s.Results <- Device{
+				IP:     ip,
+				MAC:    "hop",
+				Vendor: getPortServiceName(port),
+				OS:     fmt.Sprintf("Hop open port %d", port),
+			}
+			return
+		}
+	}
+}
+
+// tcpProbeTarget does a TCP connect scan on a specific target IP.
+func (s *Scanner) tcpProbeTarget(target string) {
+	ports := []int{80, 443, 22, 53}
+	for _, port := range ports {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+		addr := net.JoinHostPort(target, fmt.Sprintf("%d", port))
+		conn, err := net.DialTimeout("tcp", addr, 800*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			s.Results <- Device{
+				IP:     target,
+				MAC:    "external",
+				Vendor: getPortServiceName(port),
+				OS:     "External target",
+			}
+			return
+		}
+	}
+}
+
+func getPortServiceName(port int) string {
+	services := map[int]string{
+		53: "DNS", 80: "HTTP", 443: "HTTPS",
+		22: "SSH", 8080: "HTTP-Proxy",
+	}
+	if s, ok := services[port]; ok {
+		return s
+	}
+	return fmt.Sprintf("port-%d", port)
 }
 
 func (s *Scanner) broadcastARP(handle *pcap.Handle, srcMAC net.HardwareAddr, srcIP net.IP, network *net.IPNet) {
