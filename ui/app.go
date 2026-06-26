@@ -6,6 +6,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -66,6 +67,15 @@ type DeviceFoundMsg scanner.Device
 // ── Port Scanner Messages ──────────────────────────────────────────
 type PortResultMsg scanner.PortResult
 type PortScanDoneMsg struct{}
+
+// ── Interface Refresh Ticker ──────────────────────────────────────
+type tickRefreshInterfacesMsg time.Time
+
+func doInterfaceTick() tea.Cmd {
+	return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
+		return tickRefreshInterfacesMsg(t)
+	})
+}
 
 func InitialModel() tea.Model {
 	ifaces, err := pcap.FindAllDevs()
@@ -295,6 +305,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case modePassiveOnly:
 					m.logMessage = "Mode: Pure Passive Sniffing dipilih. Pilih interface jaringan..."
 				}
+				return m, doInterfaceTick()
 
 			case stateSelectIface:
 				if len(m.interfaces) > 0 {
@@ -395,6 +406,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.logMessage = fmt.Sprintf("Port scan selesai: %d port terbuka dari %d port di %s.",
 			openCount, len(m.portResults), m.targetPortIP)
+
+	case tickRefreshInterfacesMsg:
+		// Auto-refresh network interfaces while user is on interface selection page
+		if m.state == stateSelectIface {
+			newIfaces, err := pcap.FindAllDevs()
+			if err == nil {
+				m.interfaces = newIfaces
+				// Keep cursor in bounds
+				if m.cursor >= len(m.interfaces) && len(m.interfaces) > 0 {
+					m.cursor = len(m.interfaces) - 1
+				}
+			}
+			return m, doInterfaceTick()
+		}
 	}
 
 	// Table scrolling for scanning state
