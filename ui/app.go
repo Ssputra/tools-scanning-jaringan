@@ -469,7 +469,7 @@ func (m model) View() string {
 
 		s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
 			"  Contoh: 192.168.1.1, 10.0.0.1, 172.16.0.1\n" +
-				"  Port yang di-scan: 21,22,23,25,53,80,110,135,139,143,443,445,993,995,3306,3389,5900,8080,8443,9100\n\n" +
+				"  Port yang di-scan: SEMUA port (1 - 65535) via 1500 goroutine worker\n\n" +
 				"  Enter untuk mulai scan | Esc untuk kembali"))
 		middleContent = s.String()
 
@@ -483,9 +483,9 @@ func (m model) View() string {
 		s.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(title) + "\n")
 
 		if len(m.portResults) == 0 && !m.portScanDone {
-			s.WriteString("\n  Sedang memindai port pada " + m.targetPortIP + "...\n")
-			s.WriteString("  Menggunakan TCP connect scan dengan " + fmt.Sprintf("%d", 24) + " port populer.\n\n")
-			s.WriteString("  Mohon tunggu...\n")
+			s.WriteString("\n  Scanning all 65535 ports on " + m.targetPortIP + "... please wait.\n")
+			s.WriteString("  1500 goroutine workers | TCP connect | 250ms timeout per port\n\n")
+			s.WriteString("  Sedang memindai...\n")
 		} else {
 			openCount := 0
 			for _, r := range m.portResults {

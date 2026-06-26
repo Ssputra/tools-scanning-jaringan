@@ -5,21 +5,15 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // PortResult represents the scan result of a single port.
 type PortResult struct {
 	Port    int    `json:"port"`
-	Status  string `json:"status"`  // "open", "closed", "filtered"
+	Status  string `json:"status"`  // "open", "closed"
 	Service string `json:"service"` // Service hint based on well-known port names
-}
-
-// commonPorts defines ports to scan by default (Top 100 subset).
-var commonPorts = []int{
-	21, 22, 23, 25, 53, 80, 110, 111, 135, 139,
-	143, 443, 445, 993, 995, 1723, 3306, 3389, 5900, 8080,
-	8443, 8888, 9100, 27017,
 }
 
 // wellKnownPorts maps port numbers to service names.
@@ -52,80 +46,80 @@ var wellKnownPorts = map[int]string{
 
 // serviceHints maps common banners/behaviors to service guesses.
 var serviceHints = map[string]string{
-	"SSH":   "SSH",
-	"HTTP":  "HTTP",
-	"FTP":   "FTP",
-	"SMTP":  "SMTP",
-	"POP":   "POP3",
-	"IMAP":  "IMAP",
-	"MikroTik": "RouterOS",
-	"RouterOS": "RouterOS",
-	"IIS":   "IIS/Windows",
-	"Apache": "Apache",
-	"nginx": "Nginx",
+	"SSH":       "SSH",
+	"HTTP":      "HTTP",
+	"FTP":       "FTP",
+	"SMTP":      "SMTP",
+	"POP":       "POP3",
+	"IMAP":      "IMAP",
+	"MikroTik":  "RouterOS",
+	"RouterOS":  "RouterOS",
+	"IIS":       "IIS/Windows",
+	"Apache":    "Apache",
+	"nginx":     "Nginx",
 	"Microsoft": "Windows",
-	"Linux": "Linux",
+	"Linux":     "Linux",
 }
 
-// PortScanConfig holds configuration for a port scan.
-type PortScanConfig struct {
-	Target      string
-	Ports       []int           // nil = use commonPorts
-	Timeout     time.Duration   // per-port connect timeout
-	WorkerCount int             // concurrent goroutines
-}
+const (
+	totalPorts   = 65535
+	workerCount  = 1500
+	dialTimeout  = 250 * time.Millisecond
+	bannerTimeout = 200 * time.Millisecond
+)
 
-// ScanTargetPorts performs a port scan on the target IP and sends results
-// one-by-one to the channel. Closes the channel when done.
+// ScanTargetPorts scans ALL 65535 ports on target IP using an aggressive
+// goroutine worker pool. Results (only OPEN ports) are sent to resultCh.
+// Channel is closed when all ports have been scanned.
 func ScanTargetPorts(target string, resultCh chan<- PortResult) {
-	cfg := PortScanConfig{
-		Target:      target,
-		Timeout:     800 * time.Millisecond,
-		WorkerCount: 100,
-	}
-	ScanTargetPortsConfig(cfg, resultCh)
-}
-
-// ScanTargetPortsConfig is the configurable version of ScanTargetPorts.
-func ScanTargetPortsConfig(cfg PortScanConfig, resultCh chan<- PortResult) {
 	defer close(resultCh)
 
-	ports := cfg.Ports
-	if len(ports) == 0 {
-		ports = commonPorts
-	}
-	if cfg.Timeout == 0 {
-		cfg.Timeout = 800 * time.Millisecond
-	}
-	if cfg.WorkerCount <= 0 {
-		cfg.WorkerCount = 100
-	}
+	// Distribute port numbers 1..65535 via buffered channel
+	portsChan := make(chan int, 1000)
 
-	// Quick TCP connect check to see if host is alive
-	if !isHostAlive(cfg.Target, cfg.Timeout) {
-		// Host seems down, still scan a few common ports to confirm
-		ports = []int{22, 80, 443, 3389}
-	}
+	// Producer goroutine: inject all 65535 port numbers
+	go func() {
+		for port := 1; port <= totalPorts; port++ {
+			portsChan <- port
+		}
+		close(portsChan)
+	}()
 
-	// Worker pool
-	jobs := make(chan int, len(ports))
-	for _, p := range ports {
-		jobs <- p
-	}
-	close(jobs)
-
-	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var openCount int64
 
-	for i := 0; i < cfg.WorkerCount; i++ {
+	// Spawn 1500 worker goroutines
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for port := range jobs {
-				result := scanPort(cfg.Target, port, cfg.Timeout)
-				mu.Lock()
-				resultCh <- result
-				mu.Unlock()
+			for port := range portsChan {
+				addr := net.JoinHostPort(target, fmt.Sprintf("%d", port))
+				conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+				if err != nil {
+					continue // closed/filtered — skip silently
+				}
+				conn.Close()
+				atomic.AddInt64(&openCount, 1)
+
+				service := getPortService(port)
+
+				// Grab banner to identify service (only for open ports)
+				banner := grabBannerFast(target, port)
+				if banner != "" {
+					for keyword, hint := range serviceHints {
+						if containsIgnoreCase(banner, keyword) {
+							service = hint
+							break
+						}
+					}
+				}
+
+				resultCh <- PortResult{
+					Port:    port,
+					Status:  "open",
+					Service: service,
+				}
 			}
 		}()
 	}
@@ -133,82 +127,36 @@ func ScanTargetPortsConfig(cfg PortScanConfig, resultCh chan<- PortResult) {
 	wg.Wait()
 }
 
-func isHostAlive(ip string, timeout time.Duration) bool {
-	// Try a quick connect to common ports
-	quickPorts := []int{80, 443, 22, 445, 135, 8080}
-	for _, port := range quickPorts {
-		addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
-		conn, err := net.DialTimeout("tcp", addr, timeout/3)
-		if err == nil {
-			conn.Close()
-			return true
-		}
-	}
-	// Even if all fail, the host might just have a firewall — scan anyway
-	return true
-}
-
-func scanPort(ip string, port int, timeout time.Duration) PortResult {
+// grabBannerFast does a quick banner grab with a tight timeout.
+func grabBannerFast(ip string, port int) string {
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
-	service := getPortService(port)
-
-	conn, err := net.DialTimeout("tcp", addr, timeout)
-	if err != nil {
-		// Could be closed or filtered
-		return PortResult{
-			Port:    port,
-			Status:  "closed",
-			Service: service,
-		}
-	}
-	conn.Close()
-
-	// Port is open — try to grab a banner for more detail
-	banner := grabBanner(ip, port, timeout)
-	if banner != "" {
-		// Try to identify service from banner
-		for keyword, hint := range serviceHints {
-			if containsIgnoreCase(banner, keyword) {
-				service = hint
-				break
-			}
-		}
-	}
-
-	return PortResult{
-		Port:    port,
-		Status:  "open",
-		Service: service,
-	}
-}
-
-func grabBanner(ip string, port int, timeout time.Duration) string {
-	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	conn, err := net.DialTimeout("tcp", addr, bannerTimeout)
 	if err != nil {
 		return ""
 	}
 	defer conn.Close()
 
-	conn.SetReadDeadline(time.Now().Add(timeout / 2))
-	buf := make([]byte, 512)
+	conn.SetReadDeadline(time.Now().Add(bannerTimeout))
+	buf := make([]byte, 256)
 	n, _ := conn.Read(buf)
 	if n == 0 {
 		return ""
 	}
+	return cleanBanner(string(buf[:n]))
+}
 
-	banner := string(buf[:n])
-	banner = cleanBanner(banner)
-	return banner
+func getPortService(port int) string {
+	if svc, ok := wellKnownPorts[port]; ok {
+		return svc
+	}
+	return fmt.Sprintf("port-%d", port)
 }
 
 func cleanBanner(s string) string {
-	// Remove newlines, carriage returns, and trim
 	s = replaceAll(s, "\r\n", " ")
 	s = replaceAll(s, "\n", " ")
 	s = replaceAll(s, "\r", " ")
 	s = trimSpace(s)
-	// Truncate if too long
 	if len(s) > 120 {
 		s = s[:117] + "..."
 	}
@@ -221,7 +169,7 @@ func replaceAll(s, old, new string) string {
 		if idx == -1 {
 			return s
 		}
-		s = s[:idx] + new+s[idx+len(old):]
+		s = s[:idx] + new + s[idx+len(old):]
 	}
 }
 
@@ -262,13 +210,6 @@ func toLower(s string) string {
 		b[i] = c
 	}
 	return string(b)
-}
-
-func getPortService(port int) string {
-	if svc, ok := wellKnownPorts[port]; ok {
-		return svc
-	}
-	return fmt.Sprintf("port-%d", port)
 }
 
 // SortPortResults sorts port results by port number.
