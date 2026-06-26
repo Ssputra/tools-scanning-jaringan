@@ -518,11 +518,18 @@ func (s *Scanner) StartExternalScan(ifaceName string) error {
 	go func() {
 		defer handle.Close()
 
+		// --- Phase 0: Passive Public-IP Harvester (runs continuously) ---
+		// Sniffs ALL traffic, extracts public IPs from SrcIP/DstIP,
+		// performs reverse DNS + TCP probe on each discovered public IP.
+		seenPublicIPs := make(map[string]bool)
+		var publicMu sync.Mutex
+		go s.passivePublicIPHarvester(handle, srcMAC, &seenPublicIPs, &publicMu)
+
 		// Track discovered hops to avoid duplicates
 		seenHops := make(map[string]bool)
 		var hopMu sync.Mutex
 
-		// Phase 1: ICMP TTL-trace from TTL 1 to 30
+		// --- Phase 1: ICMP TTL-trace from TTL 1 to 30 ---
 		for ttl := 1; ttl <= 30; ttl++ {
 			select {
 			case <-s.done:
@@ -554,8 +561,7 @@ func (s *Scanner) StartExternalScan(ifaceName string) error {
 			time.Sleep(50 * time.Millisecond)
 		}
 
-		// Phase 3: Final target — TCP connect to common ports
-		// Scan a set of public DNS / well-known IPs as demonstration
+		// Phase 3: Final target — TCP connect to well-known public IPs
 		targets := []string{
 			"8.8.8.8",       // Google DNS
 			"1.1.1.1",       // Cloudflare DNS
@@ -762,6 +768,171 @@ func (s *Scanner) startTTLTimeout(ip string, timeout time.Duration) {
 			}
 		}
 	})
+}
+
+// IsPublicIP returns true if the IP is a routable public address.
+// It filters out private ranges (RFC 1918), loopback, link-local, and APIPA.
+func IsPublicIP(ip net.IP) bool {
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+	// Loopback: 127.0.0.0/8
+	if ip[0] == 127 {
+		return false
+	}
+	// Link-local: 169.254.0.0/16
+	if ip[0] == 169 && ip[1] == 254 {
+		return false
+	}
+	// Private 10.0.0.0/8
+	if ip[0] == 10 {
+		return false
+	}
+	// Private 172.16.0.0/12
+	if ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31 {
+		return false
+	}
+	// Private 192.168.0.0/16
+	if ip[0] == 192 && ip[1] == 168 {
+		return false
+	}
+	// Multicast: 224.0.0.0/4
+	if ip[0] >= 224 && ip[0] <= 239 {
+		return false
+	}
+	// Broadcast
+	if ip[0] == 255 && ip[1] == 255 && ip[2] == 255 && ip[3] == 255 {
+		return false
+	}
+	// 0.0.0.0
+	if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0 {
+		return false
+	}
+	return true
+}
+
+// passivePublicIPHarvester sniffs all IPv4 traffic and harvests public IPs.
+// For each new public IP discovered (src or dst), it performs:
+//   - Reverse DNS lookup (PTR record)
+//   - TCP SYN probe on port 80/443
+//
+// This runs as a long-lived goroutine alongside ICMP TTL-trace.
+func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.HardwareAddr, seen *map[string]bool, mu *sync.Mutex) {
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	for pkt := range packetSource.Packets() {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
+		// Must be IPv4
+		ipLayer := pkt.Layer(layers.LayerTypeIPv4)
+		if ipLayer == nil {
+			continue
+		}
+		ipv4 := ipLayer.(*layers.IPv4)
+
+		// Extract both source and destination IPs
+		candidates := []net.IP{ipv4.SrcIP, ipv4.DstIP}
+
+		for _, ip := range candidates {
+			if ip == nil || !IsPublicIP(ip) {
+				continue
+			}
+
+			ipStr := ip.String()
+
+			// Deduplicate by IP only (MAC is irrelevant for public IPs)
+			mu.Lock()
+			if (*seen)[ipStr] {
+				mu.Unlock()
+				continue
+			}
+			(*seen)[ipStr] = true
+			mu.Unlock()
+
+			// Aggressive Reverse DNS (PTR record)
+			hostname := ""
+			names, err := net.LookupAddr(ipStr)
+			if err == nil && len(names) > 0 {
+				hostname = names[0]
+				// Strip trailing dot from PTR record
+				hostname = strings.TrimSuffix(hostname, ".")
+			}
+
+			// Determine vendor hint from hostname patterns
+			vendor := "Public IP"
+			osType := "WAN Device"
+			lowerHost := strings.ToLower(hostname)
+			switch {
+			case strings.Contains(lowerHost, "google") || strings.Contains(lowerHost, "gstatic") || strings.Contains(lowerHost, "1e100"):
+				vendor = "Google/CDN"
+				osType = "Google CDN"
+			case strings.Contains(lowerHost, "cloudflare"):
+				vendor = "Cloudflare"
+				osType = "Cloudflare CDN"
+			case strings.Contains(lowerHost, "amazonaws") || strings.Contains(lowerHost, "aws"):
+				vendor = "Amazon AWS"
+				osType = "AWS Cloud"
+			case strings.Contains(lowerHost, "akamai"):
+				vendor = "Akamai CDN"
+				osType = "Akamai CDN"
+			case strings.Contains(lowerHost, "azure"):
+				vendor = "Microsoft Azure"
+				osType = "Azure Cloud"
+			case strings.Contains(lowerHost, "facebook") || strings.Contains(lowerHost, "fbcdn"):
+				vendor = "Meta/Facebook"
+				osType = "Meta CDN"
+			case strings.Contains(lowerHost, "apple"):
+				vendor = "Apple"
+				osType = "Apple CDN"
+			}
+
+			s.Results <- Device{
+				IP:       ipStr,
+				MAC:      "public-wan",
+				Hostname: hostname,
+				Vendor:   vendor,
+				OS:       osType,
+			}
+
+			// TCP SYN probe: port 80 and 443 (300ms timeout)
+			go s.tcpProbePublicIP(ipStr)
+		}
+	}
+}
+
+// tcpProbePublicIP does a lightning-fast TCP connect scan on a public IP.
+// If port 443 is open, it labels the device as "HTTPS / Web Server".
+func (s *Scanner) tcpProbePublicIP(ip string) {
+	timeout := 300 * time.Millisecond
+
+	// Try port 443 first (most important for CDN/web detection)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "443"), timeout)
+	if err == nil {
+		conn.Close()
+		s.Results <- Device{
+			IP:     ip,
+			MAC:    "public-wan",
+			Vendor: "HTTPS / Web Server",
+			OS:     "Web Server (port 443 open)",
+		}
+		return
+	}
+
+	// Try port 80
+	conn, err = net.DialTimeout("tcp", net.JoinHostPort(ip, "80"), timeout)
+	if err == nil {
+		conn.Close()
+		s.Results <- Device{
+			IP:     ip,
+			MAC:    "public-wan",
+			Vendor: "HTTP / Web Server",
+			OS:     "Web Server (port 80 open)",
+		}
+	}
 }
 
 func inc(ip net.IP) {
