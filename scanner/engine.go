@@ -139,10 +139,19 @@ func (s *Scanner) Start() error {
 						targetMAC := net.HardwareAddr(arp.SourceHwAddress)
 						targetIP := net.IP(arp.SourceProtAddress)
 
+						// Skip our own packets and unusable IPs
+						if targetMAC.String() == srcMAC.String() {
+							continue
+						}
+						ipStr := targetIP.String()
+						if ipStr == "0.0.0.0" || ipStr == "" || ipStr == "<nil>" {
+							continue
+						}
+
 						// Initial OS detect without TTL (Passive)
 						vendor, osType := DetectOS(targetMAC.String(), 0)
 						s.Results <- Device{
-							IP:     targetIP.String(),
+							IP:     ipStr,
 							MAC:    targetMAC.String(),
 							Vendor: vendor,
 							OS:     osType,
@@ -152,13 +161,13 @@ func (s *Scanner) Start() error {
 						s.sendICMP(handle, srcMAC, targetMAC, srcIP, targetIP)
 
 						// 2b. Start TTL probe timeout (3 detik)
-						s.startTTLTimeout(targetIP.String(), 3*time.Second)
+						s.startTTLTimeout(ipStr, 3*time.Second)
 
 						// 3. Asynchronous Hostname Lookup
-						go s.lookupHostname(targetIP.String())
+						go s.lookupHostname(ipStr)
 
 						// 4. Asynchronous MikroTik Probing (Winbox Port 8291)
-						go s.verifyMikrotik(targetIP.String())
+						go s.verifyMikrotik(ipStr)
 					}
 				}
 
@@ -171,6 +180,10 @@ func (s *Scanner) Start() error {
 							// Pastikan paket ditujukan kembali ke kita
 							if ipv4.DstIP.Equal(srcIP) {
 								targetIP := ipv4.SrcIP.String()
+								// Filter out unusable IPs
+								if targetIP == "0.0.0.0" || targetIP == "" || targetIP == "<nil>" {
+									continue
+								}
 								var targetMAC string
 								if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
 									eth := ethLayer.(*layers.Ethernet)
@@ -291,9 +304,18 @@ func (s *Scanner) StartActiveOnly() error {
 						targetMAC := net.HardwareAddr(arp.SourceHwAddress)
 						targetIP := net.IP(arp.SourceProtAddress)
 
+						// Skip our own packets and unusable IPs
+						if targetMAC.String() == srcMAC.String() {
+							continue
+						}
+						ipStr := targetIP.String()
+						if ipStr == "0.0.0.0" || ipStr == "" || ipStr == "<nil>" {
+							continue
+						}
+
 						vendor, osType := DetectOS(targetMAC.String(), 0)
 						s.Results <- Device{
-							IP:     targetIP.String(),
+							IP:     ipStr,
 							MAC:    targetMAC.String(),
 							Vendor: vendor,
 							OS:     osType,
@@ -302,10 +324,10 @@ func (s *Scanner) StartActiveOnly() error {
 						s.sendICMP(handle, srcMAC, targetMAC, srcIP, targetIP)
 
 						// Start TTL probe timeout (3 detik)
-						s.startTTLTimeout(targetIP.String(), 3*time.Second)
+						s.startTTLTimeout(ipStr, 3*time.Second)
 
-						go s.lookupHostname(targetIP.String())
-						go s.verifyMikrotik(targetIP.String())
+						go s.lookupHostname(ipStr)
+						go s.verifyMikrotik(ipStr)
 					}
 				}
 
@@ -317,6 +339,10 @@ func (s *Scanner) StartActiveOnly() error {
 						if icmp.TypeCode.Type() == layers.ICMPv4TypeEchoReply || icmp.TypeCode.Type() == layers.ICMPv4TypeEchoRequest {
 							if ipv4.DstIP.Equal(srcIP) {
 								targetIP := ipv4.SrcIP.String()
+								// Filter out unusable IPs
+								if targetIP == "0.0.0.0" || targetIP == "" || targetIP == "<nil>" {
+									continue
+								}
 								var targetMAC string
 								if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
 									eth := ethLayer.(*layers.Ethernet)
@@ -583,6 +609,12 @@ func (s *Scanner) passiveSniff(packets <-chan gopacket.Packet, localMAC net.Hard
 			}
 			ipv4 := ipLayer.(*layers.IPv4)
 			srcIP := ipv4.SrcIP.String()
+
+			// Filter out empty/unusable IPs
+			if srcIP == "0.0.0.0" || srcIP == "" || srcIP == "<nil>" {
+				continue
+			}
+
 			macStr := srcMAC.String()
 
 			// Deduplicate: only report each MAC+IP combo once
