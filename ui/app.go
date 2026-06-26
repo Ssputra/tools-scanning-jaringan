@@ -166,7 +166,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
-		m.table.SetWidth(msg.Width - 8)
+		// Calculate available width for table (subtract border/padding margin)
+		availableWidth := msg.Width - 6
+		if availableWidth < 80 {
+			availableWidth = 80 // minimum usable width
+		}
+
+		// Responsive column widths — proportional to available terminal space
+		newCols := []table.Column{
+			{Title: "IP Address", Width: int(float32(availableWidth) * 0.15)},
+			{Title: "MAC Address", Width: int(float32(availableWidth) * 0.15)},
+			{Title: "Hostname", Width: int(float32(availableWidth) * 0.25)},
+			{Title: "Vendor", Width: int(float32(availableWidth) * 0.20)},
+			{Title: "Estimated OS", Width: int(float32(availableWidth) * 0.25)},
+		}
+		// Ensure minimum column widths so headers don't get clipped
+		for i := range newCols {
+			if newCols[i].Width < 10 {
+				newCols[i].Width = 10
+			}
+		}
+
+		m.table.SetColumns(newCols)
+		m.table.SetWidth(availableWidth)
+
 		tableHeight := msg.Height - 12
 		if tableHeight < 3 {
 			tableHeight = 3
