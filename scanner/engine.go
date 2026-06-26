@@ -132,6 +132,16 @@ func (s *Scanner) Start() error {
 					continue
 				}
 
+				// ═══ GLOBAL FILTER: Skip packets from our own interface ═══
+				if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
+					eth := ethLayer.(*layers.Ethernet)
+					if eth.SrcMAC.String() == srcMAC.String() {
+						continue
+					}
+				} else {
+					continue
+				}
+
 				// 1. Sniff ARP Replies
 				if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
 					arp := arpLayer.(*layers.ARP)
@@ -294,6 +304,16 @@ func (s *Scanner) StartActiveOnly() error {
 				return
 			case packet := <-in:
 				if packet == nil {
+					continue
+				}
+
+				// ═══ GLOBAL FILTER: Skip packets from our own interface ═══
+				if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
+					eth := ethLayer.(*layers.Ethernet)
+					if eth.SrcMAC.String() == srcMAC.String() {
+						continue
+					}
+				} else {
 					continue
 				}
 
