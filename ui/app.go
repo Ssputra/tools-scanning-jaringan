@@ -203,6 +203,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// ── State: Port Scanning results — intercept 'b'/'esc' BEFORE table sees them ──
+		if m.state == statePortScanning {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				return m, tea.Quit
+			case "esc", "b":
+				m.state = stateInputPortIP
+				m.portInput.Focus()
+				m.logMessage = "Masukkan IP target untuk port scan."
+				m.portChan = nil
+				return m, nil
+			}
+			// All other keys → pass to portTable for scrolling
+			var cmd tea.Cmd
+			m.portTable, cmd = m.portTable.Update(msg)
+			return m, cmd
+		}
+
 		// ── All other states: normal keybindings ──
 		switch msg.String() {
 		case "ctrl+c", "q":
@@ -302,20 +320,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case stateSelectIface:
 				m.state = stateSelectMode
 				m.logMessage = "Pilih mode scanning untuk memulai."
-			case statePortScanning:
-				m.state = stateInputPortIP
-				m.portInput.Focus()
-				m.logMessage = "Masukkan IP target untuk port scan."
-				m.portChan = nil
-			}
-
-		case "b":
-			switch m.state {
-			case statePortScanning:
-				m.state = stateInputPortIP
-				m.portInput.Focus()
-				m.logMessage = "Masukkan IP target untuk port scan."
-				m.portChan = nil
 			}
 		}
 
@@ -377,20 +381,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			openCount, len(m.portResults), m.targetPortIP)
 	}
 
-	// Update list/table default BubbleTea
+	// Update table for scanning state only (portTable and portInput handled in isolated blocks above)
 	if m.state == stateScanning {
 		var cmd tea.Cmd
 		m.table, cmd = m.table.Update(msg)
-		cmds = append(cmds, cmd)
-	}
-	if m.state == statePortScanning {
-		var cmd tea.Cmd
-		m.portTable, cmd = m.portTable.Update(msg)
-		cmds = append(cmds, cmd)
-	}
-	if m.state == stateInputPortIP {
-		var cmd tea.Cmd
-		m.portInput, cmd = m.portInput.Update(msg)
 		cmds = append(cmds, cmd)
 	}
 
