@@ -118,8 +118,8 @@ func (s *Scanner) Start() error {
 		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 		in := packetSource.Packets()
 
-		// Background Goroutine: Send broadcast ARP
-		go s.broadcastARP(handle, srcMAC, srcIP, network)
+		// Background Goroutine: Send broadcast ARP (1 wave, no inter-wave delay for hybrid mode)
+		go s.broadcastARP(handle, srcMAC, srcIP, network, 1, 0)
 
 		// Background Goroutine: Passive Sniffer — listens to ALL packets on the wire
 		go s.passiveSniff(in, srcMAC, &passiveSeen, &passiveMu)
@@ -231,14 +231,22 @@ func (s *Scanner) Start() error {
 // StartActiveOnly launches Active-Only mode: ARP broadcast + ARP/ICMP reply
 // handler. The passive sniffer goroutine is NOT started, so only devices that
 // reply to ARP requests within the local subnet will be detected.
+// StartActiveOnly launches an aggressive Local LAN scan.
+// Architecture: "Aggressive Retries + Extended Listener + Parallel Passive"
+//
+// 1. ARP Bombing: 4 waves of ARP requests with 400ms inter-wave delay
+//    to wake sleeping Wi-Fi chips on mobile devices.
+// 2. Extended Listener: sniffs for 5 seconds AFTER the last ARP wave
+//    to catch late-responding mobile devices.
+// 3. Parallel Passive: simultaneously captures UDP/TCP packets (mDNS,
+//    LLMNR, NetBIOS) from local subnet — any device that sends traffic
+//    but doesn't respond to ARP is still discovered.
 func (s *Scanner) StartActiveOnly() error {
-	// Open live capture
 	handle, err := pcap.OpenLive(s.InterfaceName, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("failed to open pcap (need Administrator/Npcap?): %v", err)
 	}
 
-	// Find the matching interface details
 	devs, err := pcap.FindAllDevs()
 	if err != nil {
 		return fmt.Errorf("error finding devices: %v", err)
@@ -251,7 +259,6 @@ func (s *Scanner) StartActiveOnly() error {
 			break
 		}
 	}
-
 	if pcapDev == nil {
 		return fmt.Errorf("interface %s not found", s.InterfaceName)
 	}
@@ -265,12 +272,10 @@ func (s *Scanner) StartActiveOnly() error {
 			break
 		}
 	}
-
 	if srcIP == nil {
 		return fmt.Errorf("no valid IPv4 address found on interface")
 	}
 
-	// Map interface to local MAC address
 	var srcMAC net.HardwareAddr
 	ifaces, _ := net.Interfaces()
 	for _, i := range ifaces {
@@ -282,50 +287,64 @@ func (s *Scanner) StartActiveOnly() error {
 			}
 		}
 	}
-
 	if srcMAC == nil {
 		return fmt.Errorf("could not determine local MAC address")
 	}
 
-	// Start the Sniffer and Sender Goroutine (Active Only — NO passive sniffer)
 	go func() {
 		defer handle.Close()
 
 		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 		in := packetSource.Packets()
 
-		// Background Goroutine: Send broadcast ARP
-		go s.broadcastARP(handle, srcMAC, srcIP, network)
+		// Track IPs already discovered via ARP (for passive cross-reference)
+		arpDiscovered := make(map[string]bool)
+		var arpMu sync.Mutex
 
-		// NO passiveSniff goroutine here — Active Only mode
+		// Signal channel: closed when ARP bombing + 5s grace period ends
+		scanDone := make(chan struct{})
 
+		// ═══ Phase 1: Aggressive ARP Bombing (4 waves, 400ms gap) ═══
+		go func() {
+			s.broadcastARP(handle, srcMAC, srcIP, network, 4, 400*time.Millisecond)
+			// Extended grace period: wait 5 seconds after last wave
+			// for sleeping mobile devices to wake up and respond
+			time.Sleep(5 * time.Second)
+			close(scanDone)
+		}()
+
+		// ═══ Phase 2: Packet Listener + Passive Sniffing ═══
+		// Runs continuously while ARP bombing and 5s after.
+		// Captures: ARP Replies, ICMP Replies, and passive UDP/TCP traffic.
 		for {
 			select {
 			case <-s.done:
+				return
+			case <-scanDone:
 				return
 			case packet := <-in:
 				if packet == nil {
 					continue
 				}
 
-				// ═══ GLOBAL FILTER: Skip packets from our own interface ═══
-				if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
-					eth := ethLayer.(*layers.Ethernet)
-					if eth.SrcMAC.String() == srcMAC.String() {
-						continue
-					}
-				} else {
+				// ── GLOBAL FILTER: Skip packets from our own interface ──
+				ethLayer := packet.Layer(layers.LayerTypeEthernet)
+				if ethLayer == nil {
 					continue
 				}
+				eth := ethLayer.(*layers.Ethernet)
+				if eth.SrcMAC.String() == srcMAC.String() {
+					continue
+				}
+				srcMACfromPkt := eth.SrcMAC
 
-				// 1. Sniff ARP Replies
+				// ── 1. Sniff ARP Replies (Active Discovery) ──
 				if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
 					arp := arpLayer.(*layers.ARP)
 					if arp.Operation == layers.ARPReply {
 						targetMAC := net.HardwareAddr(arp.SourceHwAddress)
 						targetIP := net.IP(arp.SourceProtAddress)
 
-						// Skip our own packets and unusable IPs
 						if targetMAC.String() == srcMAC.String() {
 							continue
 						}
@@ -333,6 +352,10 @@ func (s *Scanner) StartActiveOnly() error {
 						if ipStr == "0.0.0.0" || ipStr == "" || ipStr == "<nil>" {
 							continue
 						}
+
+						arpMu.Lock()
+						arpDiscovered[ipStr] = true
+						arpMu.Unlock()
 
 						vendor, osType := DetectOS(targetMAC.String(), 0)
 						s.Results <- Device{
@@ -343,36 +366,31 @@ func (s *Scanner) StartActiveOnly() error {
 						}
 
 						s.sendICMP(handle, srcMAC, targetMAC, srcIP, targetIP)
-
-						// Start TTL probe timeout (3 detik)
 						s.startTTLTimeout(ipStr, 3*time.Second)
-
 						go s.lookupHostname(ipStr)
 						go s.verifyMikrotik(ipStr)
 					}
 				}
 
-				// 2. Sniff ICMP/IPv4 Replies for TTL
+				// ── 2. Sniff ICMP/IPv4 Replies for TTL ──
 				if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 					ipv4 := ipLayer.(*layers.IPv4)
-					if icmpLayer := packet.Layer(layers.LayerTypeICMPv4); icmpLayer != nil {
-						icmp := icmpLayer.(*layers.ICMPv4)
-						if icmp.TypeCode.Type() == layers.ICMPv4TypeEchoReply || icmp.TypeCode.Type() == layers.ICMPv4TypeEchoRequest {
-							if ipv4.DstIP.Equal(srcIP) {
+					if ipv4.DstIP.Equal(srcIP) {
+						if icmpLayer := packet.Layer(layers.LayerTypeICMPv4); icmpLayer != nil {
+							icmp := icmpLayer.(*layers.ICMPv4)
+							if icmp.TypeCode.Type() == layers.ICMPv4TypeEchoReply ||
+								icmp.TypeCode.Type() == layers.ICMPv4TypeEchoRequest {
 								targetIP := ipv4.SrcIP.String()
-								// Filter out unusable IPs
 								if targetIP == "0.0.0.0" || targetIP == "" || targetIP == "<nil>" {
 									continue
 								}
-								var targetMAC string
-								if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
-									eth := ethLayer.(*layers.Ethernet)
-									targetMAC = eth.SrcMAC.String()
-								}
 
+								arpMu.Lock()
+								arpDiscovered[targetIP] = true
+								arpMu.Unlock()
+
+								targetMAC := srcMACfromPkt.String()
 								vendor, osType := DetectOS(targetMAC, ipv4.TTL)
-
-								// Tandai IP ini sudah menerima respons TTL
 								s.ttlResolved.Store(targetIP, true)
 
 								s.Results <- Device{
@@ -389,11 +407,126 @@ func (s *Scanner) StartActiveOnly() error {
 						}
 					}
 				}
+
+				// ── 3. Passive Sniffing: UDP/TCP from local subnet ──
+				// Catches devices that send traffic (mDNS, LLMNR, NetBIOS,
+				// TCP keepalive, etc.) but don't respond to ARP — common
+				// for sleeping Android/iOS devices.
+				if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
+					ipv4 := ipLayer.(*layers.IPv4)
+					pktSrcIP := ipv4.SrcIP
+
+					// Only process IPs within our local subnet
+					if !network.Contains(pktSrcIP) {
+						continue
+					}
+
+					pktSrcIPStr := pktSrcIP.String()
+					if pktSrcIPStr == "0.0.0.0" || pktSrcIPStr == "" || pktSrcIPStr == "<nil>" {
+						continue
+					}
+
+					// Skip if already discovered via ARP
+					arpMu.Lock()
+					alreadyDiscovered := arpDiscovered[pktSrcIPStr]
+					arpMu.Unlock()
+					if alreadyDiscovered {
+						continue
+					}
+
+					// Skip broadcast/multicast source MAC
+					if srcMACfromPkt[0]&0x01 != 0 {
+						continue
+					}
+
+					// Detect protocol for smarter labeling
+					hostname := ""
+					protoLabel := "Local Device (passive)"
+
+					if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+						udp := udpLayer.(*layers.UDP)
+						srcPort := uint16(udp.SrcPort)
+						dstPort := uint16(udp.DstPort)
+
+						switch {
+						case srcPort == 5353 || dstPort == 5353:
+							protoLabel = "mDNS Device"
+							hostname = extractMDNSName(packet)
+						case srcPort == 5355 || dstPort == 5355:
+							protoLabel = "LLMNR Device"
+						case srcPort == 137 || dstPort == 137:
+							protoLabel = "NetBIOS Device"
+						case srcPort == 53 || dstPort == 53:
+							protoLabel = "DNS Client"
+						}
+					}
+
+					if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+						tcp := tcpLayer.(*layers.TCP)
+						srcPort := uint16(tcp.SrcPort)
+						dstPort := uint16(tcp.DstPort)
+						// Only label as "TCP Client" if it's NOT a well-known server port
+						if srcPort > 1024 && dstPort > 1024 {
+							protoLabel = "TCP Client"
+						}
+					}
+
+					// Force-register this passive device
+					arpMu.Lock()
+					arpDiscovered[pktSrcIPStr] = true
+					arpMu.Unlock()
+
+					s.Results <- Device{
+						IP:       pktSrcIPStr,
+						MAC:      srcMACfromPkt.String(),
+						Hostname: hostname,
+						Vendor:   protoLabel,
+						OS:       "Local Device (passive)",
+					}
+
+					go s.lookupHostname(pktSrcIPStr)
+				}
 			}
 		}
 	}()
 
 	return nil
+}
+
+// extractMDNSName attempts to pull a human-readable hostname from an mDNS
+// packet (UDP port 5353). It scans the raw payload for printable strings
+// that look like hostnames (e.g. "MyPhone.local").
+func extractMDNSName(pkt gopacket.Packet) string {
+	payload := pkt.TransportLayer()
+	if payload == nil {
+		return ""
+	}
+	// Get raw payload bytes
+	if udpLayer := pkt.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		udp := udpLayer.(*layers.UDP)
+		data := udp.Payload
+		// mDNS payload is a DNS packet — look for the query name
+		// Simple heuristic: scan for printable ASCII sequences >= 4 chars
+		var current []byte
+		for _, b := range data {
+			if b >= 32 && b <= 126 {
+				current = append(current, b)
+			} else {
+				if len(current) >= 4 {
+					name := string(current)
+					// Skip common noise
+					if name != "pointer" && name != "local" && !strings.HasPrefix(name, "_") {
+						return strings.TrimSuffix(name, ".")
+					}
+				}
+				current = nil
+			}
+		}
+		if len(current) >= 4 {
+			return strings.TrimSuffix(string(current), ".")
+		}
+	}
+	return ""
 }
 
 // StartPassive opens pcap in promiscuous mode and runs ONLY the passive
@@ -736,15 +869,35 @@ func getPortServiceName(port int) string {
 	return fmt.Sprintf("port-%d", port)
 }
 
-func (s *Scanner) broadcastARP(handle *pcap.Handle, srcMAC net.HardwareAddr, srcIP net.IP, network *net.IPNet) {
-	ip := srcIP.Mask(network.Mask)
-	for {
-		inc(ip)
-		if !network.Contains(ip) {
-			break
+// broadcastARP sends ARP requests to every IP in the subnet.
+// It runs "waves" rounds with inter-wave delay to wake sleeping devices.
+// Each wave sends one ARP per IP with 2ms spacing to avoid flooding.
+func (s *Scanner) broadcastARP(handle *pcap.Handle, srcMAC net.HardwareAddr, srcIP net.IP, network *net.IPNet, waves int, interWaveDelay time.Duration) {
+	for wave := 1; wave <= waves; wave++ {
+		select {
+		case <-s.done:
+			return
+		default:
 		}
-		s.sendARPRequest(handle, srcMAC, srcIP, ip)
-		time.Sleep(2 * time.Millisecond) // Cegah network flooding
+
+		// Build IP list for this subnet (copy so we don't mutate)
+		startIP := make(net.IP, len(srcIP))
+		copy(startIP, srcIP)
+		ip := startIP.Mask(network.Mask)
+
+		for {
+			inc(ip)
+			if !network.Contains(ip) {
+				break
+			}
+			s.sendARPRequest(handle, srcMAC, srcIP, ip)
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// Delay between waves (skip after last wave)
+		if wave < waves {
+			time.Sleep(interWaveDelay)
+		}
 	}
 }
 
