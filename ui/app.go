@@ -156,10 +156,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
-		// Atur lebar tabel = lebar terminal - margin(2) - border luar(2) - padding dalam(4)
 		m.table.SetWidth(msg.Width - 8)
-
-		// Atur tinggi tabel dinamis: terminal - margin/border/padding(7) - header(1) - footer(2) - spasi(2)
 		tableHeight := msg.Height - 12
 		if tableHeight < 3 {
 			tableHeight = 3
@@ -167,17 +164,55 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.table.SetHeight(tableHeight)
 
 	case tea.KeyMsg:
-		// ── State: Input Port IP — isolate keybindings so textinput gets backspace ──
-		if m.state == stateInputPortIP {
-			switch msg.String() {
-			case "ctrl+c":
-				return m, tea.Quit
-			case "esc":
+		key := msg.String()
+
+		// ══════════════════════════════════════════════════════════════
+		// UNIVERSAL BACK NAVIGATION — runs before any component gets the event
+		// ══════════════════════════════════════════════════════════════
+		if key == "esc" || key == "b" {
+			switch m.state {
+			case stateSelectMode:
+				// Root menu — do nothing (or quit)
+			case stateSelectIface:
+				m.state = stateSelectMode
+				m.logMessage = "Pilih mode scanning untuk memulai."
+				return m, nil
+			case stateScanning:
+				if m.scanner != nil {
+					m.scanner.Stop()
+				}
+				m.state = stateSelectIface
+				m.logMessage = "Pilih interface jaringan."
+				return m, nil
+			case stateInputPortIP:
 				m.state = stateSelectMode
 				m.logMessage = "Pilih mode scanning untuk memulai."
 				m.portInput.SetValue("")
 				return m, nil
-			case "enter":
+			case statePortScanning:
+				m.state = stateInputPortIP
+				m.portInput.Focus()
+				m.logMessage = "Masukkan IP target untuk port scan."
+				m.portChan = nil
+				return m, nil
+			}
+		}
+
+		// Quit from anywhere
+		if key == "ctrl+c" || key == "q" {
+			if m.scanner != nil {
+				m.scanner.Stop()
+			}
+			return m, tea.Quit
+		}
+
+		// ══════════════════════════════════════════════════════════════
+		// STATE-ISOLATED KEY HANDLING — protects textinput/table from swallowing keys
+		// ══════════════════════════════════════════════════════════════
+
+		// stateInputPortIP: only enter goes through to logic, rest → textinput
+		if m.state == stateInputPortIP {
+			if key == "enter" {
 				ip := strings.TrimSpace(m.portInput.Value())
 				if ip == "" {
 					m.logMessage = "IP tidak boleh kosong! Ketik IP target."
@@ -197,38 +232,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				go scanner.ScanTargetPorts(ip, portChan)
 				return m, waitForPortResult(m.portChan)
 			}
-			// All other keys (backspace, letters, numbers, dots) → textinput
+			// backspace, letters, numbers, dots → textinput only
 			var cmd tea.Cmd
 			m.portInput, cmd = m.portInput.Update(msg)
 			return m, cmd
 		}
 
-		// ── State: Port Scanning results — intercept 'b'/'esc' BEFORE table sees them ──
+		// statePortScanning: arrow keys → table scrolling, everything else ignored
 		if m.state == statePortScanning {
-			switch msg.String() {
-			case "ctrl+c", "q":
-				return m, tea.Quit
-			case "esc", "b":
-				m.state = stateInputPortIP
-				m.portInput.Focus()
-				m.logMessage = "Masukkan IP target untuk port scan."
-				m.portChan = nil
-				return m, nil
-			}
-			// All other keys → pass to portTable for scrolling
 			var cmd tea.Cmd
 			m.portTable, cmd = m.portTable.Update(msg)
 			return m, cmd
 		}
 
-		// ── All other states: normal keybindings ──
-		switch msg.String() {
-		case "ctrl+c", "q":
-			if m.scanner != nil {
-				m.scanner.Stop()
-			}
-			return m, tea.Quit
-
+		// ══════════════════════════════════════════════════════════════
+		// REMAINING STATES: mode selection, interface, scanning
+		// ══════════════════════════════════════════════════════════════
+		switch key {
 		case "up", "k":
 			switch m.state {
 			case stateSelectMode:
@@ -255,7 +275,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter", "s":
 			switch m.state {
-			// ── Halaman 1: Mode Selection ───────────────────────
 			case stateSelectMode:
 				if m.modeCursor == modePortScanner {
 					m.scanMode = modePortScanner
@@ -277,7 +296,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.logMessage = "Mode: Pure Passive Sniffing dipilih. Pilih interface jaringan..."
 				}
 
-			// ── Halaman 2: Interface Selection ──────────────────
 			case stateSelectIface:
 				if len(m.interfaces) > 0 {
 					m.state = stateScanning
@@ -314,29 +332,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, waitForDevice(m.scanner.Results)
 				}
 			}
-
-		case "esc":
-			switch m.state {
-			case stateSelectIface:
-				m.state = stateSelectMode
-				m.logMessage = "Pilih mode scanning untuk memulai."
-			}
 		}
 
 	case DeviceFoundMsg:
-		// Smart merge so background Hostname probing doesn't overwrite OS/Vendor
 		d, exists := m.devices[msg.IP]
 		if !exists {
 			d = scanner.Device(msg)
 		} else {
-			if msg.MAC != "" { d.MAC = msg.MAC }
-			if msg.Hostname != "" { d.Hostname = msg.Hostname }
-			if msg.Vendor != "" && msg.Vendor != "Unknown Vendor" { d.Vendor = msg.Vendor }
-			if msg.OS != "" && msg.OS != "Unknown OS" && msg.OS != "Probing TTL..." { d.OS = msg.OS }
+			if msg.MAC != "" {
+				d.MAC = msg.MAC
+			}
+			if msg.Hostname != "" {
+				d.Hostname = msg.Hostname
+			}
+			if msg.Vendor != "" && msg.Vendor != "Unknown Vendor" {
+				d.Vendor = msg.Vendor
+			}
+			if msg.OS != "" && msg.OS != "Unknown OS" && msg.OS != "Probing TTL..." {
+				d.OS = msg.OS
+			}
 		}
 		m.devices[msg.IP] = d
 
-		// Sorting IP dinamis untuk tabel
 		var ips []string
 		for ip := range m.devices {
 			ips = append(ips, ip)
@@ -349,13 +366,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			rows = append(rows, table.Row{d.IP, d.MAC, d.Hostname, d.Vendor, d.OS})
 		}
 		m.table.SetRows(rows)
-		return m, waitForDevice(m.scanner.Results) // Dengarkan hasil selanjutnya
+		return m, waitForDevice(m.scanner.Results)
 
 	case PortResultMsg:
 		r := scanner.PortResult(msg)
 		m.portResults = append(m.portResults, r)
 
-		// Update port table sorted by port number
 		sorted := scanner.SortPortResults(m.portResults)
 		var rows []table.Row
 		for _, r := range sorted {
@@ -377,11 +393,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				openCount++
 			}
 		}
-		m.logMessage = fmt.Sprintf("Port scan selesai: %d port ditemukan terbuka dari %d port di %s. Tekan 'b' atau Esc untuk kembali.",
+		m.logMessage = fmt.Sprintf("Port scan selesai: %d port terbuka dari %d port di %s.",
 			openCount, len(m.portResults), m.targetPortIP)
 	}
 
-	// Update table for scanning state only (portTable and portInput handled in isolated blocks above)
+	// Table scrolling for scanning state
 	if m.state == stateScanning {
 		var cmd tea.Cmd
 		m.table, cmd = m.table.Update(msg)
@@ -398,16 +414,15 @@ func (m model) View() string {
 
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("27")). // Kode warna biru
+		BorderForeground(lipgloss.Color("27")).
 		Padding(1, 2).
-		Width(m.terminalWidth - 2). // Sisakan margin tipis agar aman di CMD
+		Width(m.terminalWidth - 2).
 		Height(m.terminalHeight - 3)
 
 	header := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render("*** SUPER AWESOME SCANNER ***")
 
 	var middleContent string
 	switch m.state {
-	// ── Halaman 1: Mode Selection ───────────────────────────────
 	case stateSelectMode:
 		var s strings.Builder
 		s.WriteString(lipgloss.NewStyle().Bold(true).Render("Pilih Mode Scanning") + " (Gunakan panah ↑/↓, Enter untuk pilih):\n\n")
@@ -425,7 +440,6 @@ func (m model) View() string {
 		s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("\n  Tip: Gunakan 'Pure Passive' jika laptop kamu beda subnet / IP APIPA.\n"))
 		middleContent = s.String()
 
-	// ── Halaman 2: Interface List ───────────────────────────────
 	case stateSelectIface:
 		var s strings.Builder
 		var modeTag string
@@ -438,7 +452,7 @@ func (m model) View() string {
 			modeTag = "Pure Passive Sniffing"
 		}
 		s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("Mode: "+modeTag) + "\n")
-		s.WriteString("Pilih Network Interface (Gunakan panah ↑/↓, Enter untuk pilih, Esc kembali):\n\n")
+		s.WriteString("Pilih Network Interface (Gunakan panah ↑/↓, Enter untuk pilih):\n\n")
 		for i, iface := range m.interfaces {
 			cursor := "  "
 			if m.cursor == i {
@@ -454,20 +468,15 @@ func (m model) View() string {
 			}
 			s.WriteString(fmt.Sprintf("%s[%-15s] %s\n", cursor, ipStr, desc))
 		}
-		s.WriteString("\nTekan Enter (atau 's') untuk memulai, Esc untuk kembali, 'q' untuk keluar.\n")
 		middleContent = s.String()
 
-	// ── Halaman 3: Scanning Results ─────────────────────────────
 	case stateScanning:
 		middleContent = m.table.View()
 
-	// ── Halaman 4: Port Scanner IP Input ──────────────────────
 	case stateInputPortIP:
 		var s strings.Builder
 		s.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("═══ Custom Port Scanner ═══") + "\n\n")
 		s.WriteString("Masukkan IP address target yang ingin di-scan:\n\n")
-
-		// Styled input box
 		inputBox := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("86")).
@@ -475,14 +484,11 @@ func (m model) View() string {
 			Width(50).
 			Render(m.portInput.View())
 		s.WriteString(inputBox + "\n\n")
-
 		s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
 			"  Contoh: 192.168.1.1, 10.0.0.1, 172.16.0.1\n" +
-				"  Port yang di-scan: SEMUA port (1 - 65535) via 1500 goroutine worker\n\n" +
-				"  Enter untuk mulai scan | Esc untuk kembali"))
+				"  Port yang di-scan: SEMUA port (1 - 65535) via 1500 goroutine worker"))
 		middleContent = s.String()
 
-	// ── Halaman 5: Port Scanning Results ──────────────────────
 	case statePortScanning:
 		var s strings.Builder
 		title := "═══ Port Scan: " + m.targetPortIP + " ═══"
@@ -505,23 +511,18 @@ func (m model) View() string {
 			s.WriteString(fmt.Sprintf("  Port terbuka: %d | Total di-scan: %d\n\n", openCount, len(m.portResults)))
 			s.WriteString(m.portTable.View())
 		}
-
-		if m.portScanDone {
-			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("\n  Tekan 'b' atau Esc untuk kembali.\n"))
-		} else {
-			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("\n  Tekan 'b' atau Esc untuk membatalkan.\n"))
-		}
 		middleContent = s.String()
 	}
 
+	// Universal footer
 	logLine := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Log: " + m.logMessage)
-	keysLine := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Keybindings: ↑/↓ untuk navigasi, Enter untuk pilih, 'q' untuk Quit")
+	keysLine := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("• [esc/b] Kembali • [q] Keluar")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		header,
-		"", // Spasi
+		"",
 		middleContent,
-		"", // Spasi
+		"",
 		logLine,
 		keysLine,
 	)
