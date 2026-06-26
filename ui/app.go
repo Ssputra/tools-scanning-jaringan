@@ -51,8 +51,10 @@ type model struct {
 	table          table.Model
 	err            error
 	logMessage     string
-	terminalWidth  int // lebar terminal aktif
-	terminalHeight int // tinggi terminal aktif
+	terminalWidth  int // lebar terminal mentah
+	terminalHeight int // tinggi terminal mentah
+	appWidth       int // lebar aman kotak utama (terminal - 2)
+	appHeight      int // tinggi aman kotak utama (terminal - 1)
 	// Port Scanner fields
 	portInput   textinput.Model
 	targetPortIP string
@@ -166,47 +168,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
-		// Lipgloss .Width(n) sets CONTENT width only.
-		// Border (1+1) + Padding (2+2) = 6 characters added OUTSIDE the content.
-		// So to fit within terminal: container.ContentWidth = msg.Width - 6
-		safeWidth := msg.Width - 6
-		safeHeight := msg.Height - 4
-		if safeWidth < 70 {
-			safeWidth = 70
-		}
-		if safeHeight < 10 {
-			safeHeight = 10
-		}
+		// ═══ RUMUS MATEMATIKA KETAT ═══
+		// 1. Kotak utama: sisakan 1 char kosong di kanan CMD agar tidak auto-wrap
+		m.appWidth = msg.Width - 2
+		m.appHeight = msg.Height - 1
 
-		// Inner table: subtract 2 more for table internal padding
-		availableWidth := safeWidth - 2
-		if availableWidth < 60 {
-			availableWidth = 60
+		// 2. Tabel inner: kurangi border (2 char) + padding (2 char) = 4
+		tableWidth := m.appWidth - 4
+		if tableWidth < 60 {
+			tableWidth = 60
 		}
+		m.table.SetWidth(tableWidth)
 
-		// Responsive column widths — proportional to available terminal space
-		newCols := []table.Column{
-			{Title: "IP Address", Width: int(float32(availableWidth) * 0.15)},
-			{Title: "MAC Address", Width: int(float32(availableWidth) * 0.15)},
-			{Title: "Hostname", Width: int(float32(availableWidth) * 0.25)},
-			{Title: "Vendor", Width: int(float32(availableWidth) * 0.20)},
-			{Title: "Estimated OS", Width: int(float32(availableWidth) * 0.25)},
-		}
-		// Ensure minimum column widths so headers don't get clipped
-		for i := range newCols {
-			if newCols[i].Width < 10 {
-				newCols[i].Width = 10
-			}
-		}
-
-		m.table.SetColumns(newCols)
-		m.table.SetWidth(availableWidth)
-
-		tableHeight := safeHeight - 8
+		tableHeight := m.appHeight - 8
 		if tableHeight < 3 {
 			tableHeight = 3
 		}
 		m.table.SetHeight(tableHeight)
+
+		// 3. Kolom proporsional: kurangi 10 buffer untuk spasi antar kolom
+		availColWidth := tableWidth - 10
+		if availColWidth < 50 {
+			availColWidth = 50
+		}
+
+		newCols := []table.Column{
+			{Title: "IP Address", Width: int(float32(availColWidth) * 0.15)},
+			{Title: "MAC Address", Width: int(float32(availColWidth) * 0.15)},
+			{Title: "Hostname", Width: int(float32(availColWidth) * 0.30)},
+			{Title: "Vendor", Width: int(float32(availColWidth) * 0.20)},
+			{Title: "Estimated OS", Width: int(float32(availColWidth) * 0.20)},
+		}
+		for i := range newCols {
+			if newCols[i].Width < 8 {
+				newCols[i].Width = 8
+			}
+		}
+		m.table.SetColumns(newCols)
 
 	case tea.KeyMsg:
 		key := msg.String()
@@ -472,23 +470,17 @@ func (m model) View() string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Padding(1, 2).Render(fmt.Sprintf("ERROR\n\n%v\n\nTekan 'q' untuk keluar.", m.err))
 	}
 
-	// Lipgloss: .Width(n) = content only. Border(1+1) + Padding(2+2) = +6 total.
-	// So container content width = terminal width - 6
-	safeW := m.terminalWidth - 6
-	safeH := m.terminalHeight - 4
-	if safeW < 70 {
-		safeW = 70
-	}
-	if safeH < 10 {
-		safeH = 10
-	}
-
+	// ═══ RENDER BORDER DENGAN UKURAN TEPAT ═══
+	// .Width/.Height = konten inner saja. Border(+2) + Padding(+2+2) = +6 total.
+	// Agar total render = appWidth: set .Width = appWidth - 6
+	// Tapi user minta .Width = appWidth - 2 (menghitung border tebal 2 char).
+	// Kita pakai rumus user: Width = appWidth - 2, Height = appHeight - 2
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("27")).
 		Padding(1, 2).
-		Width(safeW).
-		Height(safeH)
+		Width(m.appWidth - 2).
+		Height(m.appHeight - 2)
 
 	header := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render("*** SUPER AWESOME SCANNER ***")
 
