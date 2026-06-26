@@ -3,10 +3,12 @@ package ui
 import (
 	"fmt"
 	"netscanner/scanner"
+	"net"
 	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/google/gopacket/pcap"
@@ -14,16 +16,19 @@ import (
 
 // ── Application States ──────────────────────────────────────────────
 const (
-	stateSelectMode  = iota // Halaman 1: Pilih mode scanning
-	stateSelectIface        // Halaman 2: Pilih network interface
-	stateScanning           // Halaman 3: Tabel hasil scan
+	stateSelectMode    = iota // Halaman 1: Pilih mode scanning
+	stateSelectIface          // Halaman 2: Pilih network interface
+	stateScanning             // Halaman 3: Tabel hasil scan
+	stateInputPortIP          // Halaman 4: Form input IP target port scan
+	statePortScanning         // Halaman 5: Tabel hasil port scan
 )
 
 // ── Scan Mode Constants (indices into modeLabels) ───────────────────
 const (
-	modeActiveOnly   = 0
-	modeHybrid       = 1
-	modePassiveOnly  = 2
+	modeActiveOnly  = 0
+	modeHybrid      = 1
+	modePassiveOnly = 2
+	modePortScanner = 3
 )
 
 // Mode menu labels
@@ -31,6 +36,7 @@ var modeLabels = []string{
 	"[1] Active Scan Only        (Hanya ARP Broadcast, deteksi subnet otomatis)",
 	"[2] Hybrid Scan             (ARP Broadcast + Passive Sniffing, butuh IP valid)",
 	"[3] Pure Passive Sniffing   (Hanya mendengarkan kabel LAN, tidak peduli IP / beda subnet)",
+	"[4] Custom Port Scanner     (Input IP target manual, scan port populer)",
 }
 
 type model struct {
@@ -46,17 +52,37 @@ type model struct {
 	logMessage     string
 	terminalWidth  int // lebar terminal aktif
 	terminalHeight int // tinggi terminal aktif
+	// Port Scanner fields
+	portInput   textinput.Model
+	targetPortIP string
+	portResults  []scanner.PortResult
+	portTable    table.Model
+	portChan     <-chan scanner.PortResult
+	portScanDone bool
 }
 
 type DeviceFoundMsg scanner.Device
 
+// ── Port Scanner Messages ──────────────────────────────────────────
+type PortResultMsg scanner.PortResult
+type PortScanDoneMsg struct{}
+
 func InitialModel() tea.Model {
 	ifaces, err := pcap.FindAllDevs()
+
+	// Text input for port scanner IP
+	ti := textinput.New()
+	ti.Placeholder = "Masukkan IP Target (Contoh: 192.168.1.1)"
+	ti.Focus()
+	ti.CharLimit = 45
+	ti.Width = 40
+
 	m := model{
 		state:      stateSelectMode, // Mulai dari halaman pilih mode
 		interfaces: ifaces,
 		devices:    make(map[string]scanner.Device),
 		logMessage: "Pilih mode scanning untuk memulai.",
+		portInput:  ti,
 	}
 
 	// Error handling khusus untuk perizinan dan pcap
@@ -81,6 +107,22 @@ func InitialModel() tea.Model {
 	s.Selected = s.Selected.Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57")).Bold(false)
 	m.table.SetStyles(s)
 
+	// Port Scanner result table
+	fpColumns := []table.Column{
+		{Title: "Port", Width: 8},
+		{Title: "Status", Width: 10},
+		{Title: "Service", Width: 20},
+	}
+	m.portTable = table.New(
+		table.WithColumns(fpColumns),
+		table.WithHeight(15),
+		table.WithFocused(true),
+	)
+	fpStyles := table.DefaultStyles()
+	fpStyles.Header = fpStyles.Header.BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("240")).BorderBottom(true).Bold(true)
+	fpStyles.Selected = fpStyles.Selected.Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57")).Bold(false)
+	m.portTable.SetStyles(fpStyles)
+
 	return m
 }
 
@@ -88,6 +130,17 @@ func InitialModel() tea.Model {
 func waitForDevice(sub chan scanner.Device) tea.Cmd {
 	return func() tea.Msg {
 		return DeviceFoundMsg(<-sub)
+	}
+}
+
+// waitForPortResult reads one port scan result from the channel.
+func waitForPortResult(ch <-chan scanner.PortResult) tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-ch
+		if !ok {
+			return PortScanDoneMsg{}
+		}
+		return PortResultMsg(r)
 	}
 }
 
@@ -149,9 +202,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.state {
 			// ── Halaman 1: Mode Selection ───────────────────────
 			case stateSelectMode:
+				if m.modeCursor == modePortScanner {
+					// Port Scanner mode → langsung ke form input IP
+					m.scanMode = modePortScanner
+					m.state = stateInputPortIP
+					m.portInput.SetValue("")
+					m.portInput.Focus()
+					m.logMessage = "Masukkan IP target untuk port scan. Enter untuk mulai, Esc untuk batal."
+					return m, textinput.Blink
+				}
 				m.scanMode = m.modeCursor
 				m.state = stateSelectIface
-				m.cursor = 0 // reset cursor untuk interface list
+				m.cursor = 0
 				switch m.scanMode {
 				case modeActiveOnly:
 					m.logMessage = "Mode: Active Scan Only dipilih. Pilih interface jaringan..."
@@ -160,6 +222,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case modePassiveOnly:
 					m.logMessage = "Mode: Pure Passive Sniffing dipilih. Pilih interface jaringan..."
 				}
+
+			// ── Halaman 4: Port Scanner IP Input ───────────────
+			case stateInputPortIP:
+				ip := strings.TrimSpace(m.portInput.Value())
+				if ip == "" {
+					m.logMessage = "IP tidak boleh kosong! Ketik IP target."
+					return m, textinput.Blink
+				}
+				// Validate IP format
+				if net.ParseIP(ip) == nil {
+					m.logMessage = "Format IP tidak valid! Contoh: 192.168.1.1"
+					return m, textinput.Blink
+				}
+				m.targetPortIP = ip
+				m.state = statePortScanning
+				m.portResults = nil
+				m.portScanDone = false
+				m.logMessage = "Port scanning " + ip + " sedang berjalan..."
+
+				portChan := make(chan scanner.PortResult, 50)
+				m.portChan = portChan
+				go scanner.ScanTargetPorts(ip, portChan)
+				return m, waitForPortResult(m.portChan)
 
 			// ── Halaman 2: Interface Selection ──────────────────
 			case stateSelectIface:
@@ -202,10 +287,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "backspace", "esc":
-			// Navigasi mundur antar halaman
-			if m.state == stateSelectIface {
+			switch m.state {
+			case stateSelectIface:
 				m.state = stateSelectMode
 				m.logMessage = "Pilih mode scanning untuk memulai."
+			case stateInputPortIP:
+				m.state = stateSelectMode
+				m.logMessage = "Pilih mode scanning untuk memulai."
+				m.portInput.SetValue("")
+			case statePortScanning:
+				// Kembali ke form input, stop scan
+				m.state = stateInputPortIP
+				m.portInput.Focus()
+				m.logMessage = "Masukkan IP target untuk port scan."
+				m.portChan = nil
 			}
 		}
 
@@ -236,12 +331,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.table.SetRows(rows)
 		return m, waitForDevice(m.scanner.Results) // Dengarkan hasil selanjutnya
+
+	case PortResultMsg:
+		r := scanner.PortResult(msg)
+		m.portResults = append(m.portResults, r)
+
+		// Update port table sorted by port number
+		sorted := scanner.SortPortResults(m.portResults)
+		var rows []table.Row
+		for _, r := range sorted {
+			rows = append(rows, table.Row{
+				fmt.Sprintf("%d", r.Port),
+				r.Status,
+				r.Service,
+			})
+		}
+		m.portTable.SetRows(rows)
+		return m, waitForPortResult(m.portChan)
+
+	case PortScanDoneMsg:
+		m.portScanDone = true
+		m.portChan = nil
+		openCount := 0
+		for _, r := range m.portResults {
+			if r.Status == "open" {
+				openCount++
+			}
+		}
+		m.logMessage = fmt.Sprintf("Port scan selesai: %d port ditemukan terbuka dari %d port di %s. Tekan 'b' atau Esc untuk kembali.",
+			openCount, len(m.portResults), m.targetPortIP)
 	}
 
 	// Update list/table default BubbleTea
 	if m.state == stateScanning {
 		var cmd tea.Cmd
 		m.table, cmd = m.table.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+	if m.state == statePortScanning {
+		var cmd tea.Cmd
+		m.portTable, cmd = m.portTable.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+	if m.state == stateInputPortIP {
+		var cmd tea.Cmd
+		m.portInput, cmd = m.portInput.Update(msg)
 		cmds = append(cmds, cmd)
 	}
 
@@ -317,6 +451,58 @@ func (m model) View() string {
 	// ── Halaman 3: Scanning Results ─────────────────────────────
 	case stateScanning:
 		middleContent = m.table.View()
+
+	// ── Halaman 4: Port Scanner IP Input ──────────────────────
+	case stateInputPortIP:
+		var s strings.Builder
+		s.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("═══ Custom Port Scanner ═══") + "\n\n")
+		s.WriteString("Masukkan IP address target yang ingin di-scan:\n\n")
+
+		// Styled input box
+		inputBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("86")).
+			Padding(0, 1).
+			Width(50).
+			Render(m.portInput.View())
+		s.WriteString(inputBox + "\n\n")
+
+		s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
+			"  Contoh: 192.168.1.1, 10.0.0.1, 172.16.0.1\n" +
+				"  Port yang di-scan: 21,22,23,25,53,80,110,135,139,143,443,445,993,995,3306,3389,5900,8080,8443,9100\n\n" +
+				"  Enter untuk mulai scan | Esc untuk kembali"))
+		middleContent = s.String()
+
+	// ── Halaman 5: Port Scanning Results ──────────────────────
+	case statePortScanning:
+		var s strings.Builder
+		title := "═══ Port Scan: " + m.targetPortIP + " ═══"
+		if m.portScanDone {
+			title = "═══ Port Scan Complete: " + m.targetPortIP + " ═══"
+		}
+		s.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(title) + "\n")
+
+		if len(m.portResults) == 0 && !m.portScanDone {
+			s.WriteString("\n  Sedang memindai port pada " + m.targetPortIP + "...\n")
+			s.WriteString("  Menggunakan TCP connect scan dengan " + fmt.Sprintf("%d", 24) + " port populer.\n\n")
+			s.WriteString("  Mohon tunggu...\n")
+		} else {
+			openCount := 0
+			for _, r := range m.portResults {
+				if r.Status == "open" {
+					openCount++
+				}
+			}
+			s.WriteString(fmt.Sprintf("  Port terbuka: %d | Total di-scan: %d\n\n", openCount, len(m.portResults)))
+			s.WriteString(m.portTable.View())
+		}
+
+		if m.portScanDone {
+			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("\n  Tekan 'b' atau Esc untuk kembali.\n"))
+		} else {
+			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("\n  Tekan 'b' atau Esc untuk membatalkan.\n"))
+		}
+		middleContent = s.String()
 	}
 
 	logLine := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Log: " + m.logMessage)
