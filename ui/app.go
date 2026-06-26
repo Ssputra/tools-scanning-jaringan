@@ -166,21 +166,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
-		// Safe margin: subtract columns to prevent border clipping on Windows CMD
-		// CMD auto-wraps when content touches the last column, breaking the border
-		safeWidth := msg.Width - 4
-		safeHeight := msg.Height - 2
-		if safeWidth < 80 {
-			safeWidth = 80
+		// Lipgloss .Width(n) sets CONTENT width only.
+		// Border (1+1) + Padding (2+2) = 6 characters added OUTSIDE the content.
+		// So to fit within terminal: container.ContentWidth = msg.Width - 6
+		safeWidth := msg.Width - 6
+		safeHeight := msg.Height - 4
+		if safeWidth < 70 {
+			safeWidth = 70
 		}
 		if safeHeight < 10 {
 			safeHeight = 10
 		}
 
-		// Calculate available width for table (inner padding margin)
-		availableWidth := safeWidth - 4
-		if availableWidth < 70 {
-			availableWidth = 70
+		// Inner table: subtract 2 more for table internal padding
+		availableWidth := safeWidth - 2
+		if availableWidth < 60 {
+			availableWidth = 60
 		}
 
 		// Responsive column widths — proportional to available terminal space
@@ -471,11 +472,12 @@ func (m model) View() string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Padding(1, 2).Render(fmt.Sprintf("ERROR\n\n%v\n\nTekan 'q' untuk keluar.", m.err))
 	}
 
-	// Safe margin for container: prevents border clipping on Windows CMD
-	safeW := m.terminalWidth - 4
-	safeH := m.terminalHeight - 2
-	if safeW < 80 {
-		safeW = 80
+	// Lipgloss: .Width(n) = content only. Border(1+1) + Padding(2+2) = +6 total.
+	// So container content width = terminal width - 6
+	safeW := m.terminalWidth - 6
+	safeH := m.terminalHeight - 4
+	if safeW < 70 {
+		safeW = 70
 	}
 	if safeH < 10 {
 		safeH = 10
