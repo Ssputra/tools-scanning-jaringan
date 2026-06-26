@@ -166,10 +166,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
-		// Calculate available width for table (subtract border/padding margin)
-		availableWidth := msg.Width - 6
-		if availableWidth < 80 {
-			availableWidth = 80 // minimum usable width
+		// Safe margin: subtract columns to prevent border clipping on Windows CMD
+		// CMD auto-wraps when content touches the last column, breaking the border
+		safeWidth := msg.Width - 4
+		safeHeight := msg.Height - 2
+		if safeWidth < 80 {
+			safeWidth = 80
+		}
+		if safeHeight < 10 {
+			safeHeight = 10
+		}
+
+		// Calculate available width for table (inner padding margin)
+		availableWidth := safeWidth - 4
+		if availableWidth < 70 {
+			availableWidth = 70
 		}
 
 		// Responsive column widths — proportional to available terminal space
@@ -190,7 +201,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.table.SetColumns(newCols)
 		m.table.SetWidth(availableWidth)
 
-		tableHeight := msg.Height - 12
+		tableHeight := safeHeight - 8
 		if tableHeight < 3 {
 			tableHeight = 3
 		}
@@ -460,12 +471,22 @@ func (m model) View() string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Padding(1, 2).Render(fmt.Sprintf("ERROR\n\n%v\n\nTekan 'q' untuk keluar.", m.err))
 	}
 
+	// Safe margin for container: prevents border clipping on Windows CMD
+	safeW := m.terminalWidth - 4
+	safeH := m.terminalHeight - 2
+	if safeW < 80 {
+		safeW = 80
+	}
+	if safeH < 10 {
+		safeH = 10
+	}
+
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("27")).
 		Padding(1, 2).
-		Width(m.terminalWidth - 2).
-		Height(m.terminalHeight - 3)
+		Width(safeW).
+		Height(safeH)
 
 	header := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render("*** SUPER AWESOME SCANNER ***")
 
