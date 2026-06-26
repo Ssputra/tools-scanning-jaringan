@@ -828,9 +828,16 @@ func (s *Scanner) sendICMP(handle *pcap.Handle, srcMAC, dstMAC net.HardwareAddr,
 func (s *Scanner) lookupHostname(ip string) {
 	hostname := GetAggressiveHostnameParallel(ip)
 
+	// Aggressive Override: derive OS from hostname when possible.
+	// This sends an OS hint alongside the hostname so the UI can replace
+	// the ambiguous TTL-based guess (e.g. "Linux / IoT Device") with the
+	// real device type (e.g. "Android" from "redmi-note-13-pro").
+	osFromHostname := OverrideOSFromHostname(hostname, "")
+
 	s.Results <- Device{
 		IP:       ip,
 		Hostname: hostname,
+		OS:       osFromHostname,
 	}
 }
 
