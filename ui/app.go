@@ -167,6 +167,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.table.SetHeight(tableHeight)
 
 	case tea.KeyMsg:
+		// ── State: Input Port IP — isolate keybindings so textinput gets backspace ──
+		if m.state == stateInputPortIP {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.state = stateSelectMode
+				m.logMessage = "Pilih mode scanning untuk memulai."
+				m.portInput.SetValue("")
+				return m, nil
+			case "enter":
+				ip := strings.TrimSpace(m.portInput.Value())
+				if ip == "" {
+					m.logMessage = "IP tidak boleh kosong! Ketik IP target."
+					return m, textinput.Blink
+				}
+				if net.ParseIP(ip) == nil {
+					m.logMessage = "Format IP tidak valid! Contoh: 192.168.1.1"
+					return m, textinput.Blink
+				}
+				m.targetPortIP = ip
+				m.state = statePortScanning
+				m.portResults = nil
+				m.portScanDone = false
+				m.logMessage = "Port scanning " + ip + " sedang berjalan..."
+				portChan := make(chan scanner.PortResult, 50)
+				m.portChan = portChan
+				go scanner.ScanTargetPorts(ip, portChan)
+				return m, waitForPortResult(m.portChan)
+			}
+			// All other keys (backspace, letters, numbers, dots) → textinput
+			var cmd tea.Cmd
+			m.portInput, cmd = m.portInput.Update(msg)
+			return m, cmd
+		}
+
+		// ── All other states: normal keybindings ──
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.scanner != nil {
@@ -203,7 +240,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ── Halaman 1: Mode Selection ───────────────────────
 			case stateSelectMode:
 				if m.modeCursor == modePortScanner {
-					// Port Scanner mode → langsung ke form input IP
 					m.scanMode = modePortScanner
 					m.state = stateInputPortIP
 					m.portInput.SetValue("")
@@ -223,36 +259,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.logMessage = "Mode: Pure Passive Sniffing dipilih. Pilih interface jaringan..."
 				}
 
-			// ── Halaman 4: Port Scanner IP Input ───────────────
-			case stateInputPortIP:
-				ip := strings.TrimSpace(m.portInput.Value())
-				if ip == "" {
-					m.logMessage = "IP tidak boleh kosong! Ketik IP target."
-					return m, textinput.Blink
-				}
-				// Validate IP format
-				if net.ParseIP(ip) == nil {
-					m.logMessage = "Format IP tidak valid! Contoh: 192.168.1.1"
-					return m, textinput.Blink
-				}
-				m.targetPortIP = ip
-				m.state = statePortScanning
-				m.portResults = nil
-				m.portScanDone = false
-				m.logMessage = "Port scanning " + ip + " sedang berjalan..."
-
-				portChan := make(chan scanner.PortResult, 50)
-				m.portChan = portChan
-				go scanner.ScanTargetPorts(ip, portChan)
-				return m, waitForPortResult(m.portChan)
-
 			// ── Halaman 2: Interface Selection ──────────────────
 			case stateSelectIface:
 				if len(m.interfaces) > 0 {
 					m.state = stateScanning
 					selectedIface := m.interfaces[m.cursor]
 
-					// Map UI mode index ke engine ScanMode constant
 					var engineMode string
 					switch m.scanMode {
 					case modeActiveOnly:
@@ -281,22 +293,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.err = err
 						return m, nil
 					}
-					// Mulai mendengarkan goroutine scanner
 					return m, waitForDevice(m.scanner.Results)
 				}
 			}
 
-		case "backspace", "esc":
+		case "esc":
 			switch m.state {
 			case stateSelectIface:
 				m.state = stateSelectMode
 				m.logMessage = "Pilih mode scanning untuk memulai."
-			case stateInputPortIP:
-				m.state = stateSelectMode
-				m.logMessage = "Pilih mode scanning untuk memulai."
-				m.portInput.SetValue("")
 			case statePortScanning:
-				// Kembali ke form input, stop scan
+				m.state = stateInputPortIP
+				m.portInput.Focus()
+				m.logMessage = "Masukkan IP target untuk port scan."
+				m.portChan = nil
+			}
+
+		case "b":
+			switch m.state {
+			case statePortScanning:
 				m.state = stateInputPortIP
 				m.portInput.Focus()
 				m.logMessage = "Masukkan IP target untuk port scan."
