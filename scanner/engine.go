@@ -660,65 +660,72 @@ func (s *Scanner) StartExternalScan(ifaceName string) error {
 		OS:       "Router/Gateway",
 	}
 
+	// ═══ CRITICAL: Handle lifecycle ═══
+	// The pcap handle MUST stay open as long as the scanner runs.
+	// passivePublicIPHarvester shares this handle and dies if it's closed.
+	// We keep the handle alive until s.done is received.
 	go func() {
-		defer handle.Close()
-
 		// --- Phase 0: Passive Public-IP Harvester (runs continuously) ---
-		// Sniffs ALL traffic (IPv4+IPv6), extracts public IPs from SrcIP/DstIP,
-		// excludes localIP to prevent self-detection.
 		var seenPublicIPs sync.Map
 		go s.passivePublicIPHarvester(handle, srcMAC, srcIP, &seenPublicIPs)
 
-		// Track discovered hops to avoid duplicates
-		seenHops := make(map[string]bool)
-		var hopMu sync.Mutex
+		// --- Phase 1-3: ICMP TTL-trace + TCP probes (separate goroutine) ---
+		go func() {
+			seenHops := make(map[string]bool)
+			var hopMu sync.Mutex
 
-		// --- Phase 1: ICMP TTL-trace from TTL 1 to 30 ---
-		for ttl := 1; ttl <= 30; ttl++ {
-			select {
-			case <-s.done:
-				return
-			default:
-			}
-
-			hopIP := sendTTLProbe(handle, srcMAC, srcIP, gateway, ttl)
-			if hopIP != "" {
-				hopMu.Lock()
-				if !seenHops[hopIP] {
-					seenHops[hopIP] = true
-					hopMu.Unlock()
-
-					vendor, osType := DetectOS("", 0)
-					s.Results <- Device{
-						IP:     hopIP,
-						MAC:    "discovered",
-						Vendor: vendor,
-						OS:     "Hop " + fmt.Sprintf("%d", ttl) + " — " + osType,
-					}
-
-					// Phase 2: TCP probe each hop on port 80/443
-					go s.tcpProbeHop(hopIP)
-				} else {
-					hopMu.Unlock()
+			// Phase 1: ICMP TTL-trace from TTL 1 to 30
+			for ttl := 1; ttl <= 30; ttl++ {
+				select {
+				case <-s.done:
+					return
+				default:
 				}
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
 
-		// Phase 3: Final target — TCP connect to well-known public IPs
-		targets := []string{
-			"8.8.8.8",       // Google DNS
-			"1.1.1.1",       // Cloudflare DNS
-			"208.67.222.222", // OpenDNS
-		}
-		for _, target := range targets {
-			select {
-			case <-s.done:
-				return
-			default:
+				hopIP := sendTTLProbe(handle, srcMAC, srcIP, gateway, ttl)
+				if hopIP != "" {
+					hopMu.Lock()
+					if !seenHops[hopIP] {
+						seenHops[hopIP] = true
+						hopMu.Unlock()
+
+						vendor, osType := DetectOS("", 0)
+						s.Results <- Device{
+							IP:     hopIP,
+							MAC:    "discovered",
+							Vendor: vendor,
+							OS:     "Hop " + fmt.Sprintf("%d", ttl) + " — " + osType,
+						}
+
+						go s.tcpProbeHop(hopIP)
+					} else {
+						hopMu.Unlock()
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
 			}
-			s.tcpProbeTarget(target)
-		}
+
+			// Phase 3: Final target — TCP connect to well-known public IPs
+			targets := []string{
+				"8.8.8.8",       // Google DNS
+				"1.1.1.1",       // Cloudflare DNS
+				"208.67.222.222", // OpenDNS
+			}
+			for _, target := range targets {
+				select {
+				case <-s.done:
+					return
+				default:
+				}
+				s.tcpProbeTarget(target)
+			}
+		}()
+
+		// ═══ KEEP HANDLE ALIVE until scanner stops ═══
+		// passivePublicIPHarvester needs this handle open.
+		// If we return here, defer handle.Close() kills the harvester.
+		<-s.done
+		handle.Close()
 	}()
 
 	return nil
