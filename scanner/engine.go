@@ -653,10 +653,9 @@ func (s *Scanner) StartExternalScan(ifaceName string) error {
 
 		// --- Phase 0: Passive Public-IP Harvester (runs continuously) ---
 		// Sniffs ALL traffic, extracts public IPs from SrcIP/DstIP,
-		// performs reverse DNS + TCP probe on each discovered public IP.
-		seenPublicIPs := make(map[string]bool)
-		var publicMu sync.Mutex
-		go s.passivePublicIPHarvester(handle, srcMAC, &seenPublicIPs, &publicMu)
+		// launches async goroutine per IP for reverse DNS + TCP probe.
+		var seenPublicIPs sync.Map
+		go s.passivePublicIPHarvester(handle, srcMAC, &seenPublicIPs)
 
 		// Track discovered hops to avoid duplicates
 		seenHops := make(map[string]bool)
@@ -966,12 +965,12 @@ func IsPublicIP(ip net.IP) bool {
 }
 
 // passivePublicIPHarvester sniffs all IPv4 traffic and harvests public IPs.
-// For each new public IP discovered (src or dst), it performs:
-//   - Reverse DNS lookup (PTR record)
-//   - TCP SYN probe on port 80/443
+// For each NEW public IP discovered (src or dst), it immediately launches
+// an async goroutine to perform reverse DNS + CDN detection + TCP probe.
+// Results are sent to s.Results channel as they become available.
 //
-// This runs as a long-lived goroutine alongside ICMP TTL-trace.
-func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.HardwareAddr, seen *map[string]bool, mu *sync.Mutex) {
+// Uses sync.Map for lock-free concurrent IP deduplication.
+func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.HardwareAddr, seen *sync.Map) {
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for pkt := range packetSource.Packets() {
 		select {
@@ -997,64 +996,73 @@ func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.Har
 
 			ipStr := ip.String()
 
-			// Deduplicate by IP only (MAC is irrelevant for public IPs)
-			mu.Lock()
-			if (*seen)[ipStr] {
-				mu.Unlock()
-				continue
-			}
-			(*seen)[ipStr] = true
-			mu.Unlock()
-
-			// Aggressive Reverse DNS (PTR record)
-			hostname := ""
-			names, err := net.LookupAddr(ipStr)
-			if err == nil && len(names) > 0 {
-				hostname = names[0]
-				// Strip trailing dot from PTR record
-				hostname = strings.TrimSuffix(hostname, ".")
+			// Lock-free deduplication: LoadOrStore atomically checks + registers
+			if _, loaded := seen.LoadOrStore(ipStr, true); loaded {
+				continue // already being processed
 			}
 
-			// Determine vendor hint from hostname patterns
-			vendor := "Public IP"
-			osType := "WAN Device"
-			lowerHost := strings.ToLower(hostname)
-			switch {
-			case strings.Contains(lowerHost, "google") || strings.Contains(lowerHost, "gstatic") || strings.Contains(lowerHost, "1e100"):
-				vendor = "Google/CDN"
-				osType = "Google CDN"
-			case strings.Contains(lowerHost, "cloudflare"):
-				vendor = "Cloudflare"
-				osType = "Cloudflare CDN"
-			case strings.Contains(lowerHost, "amazonaws") || strings.Contains(lowerHost, "aws"):
-				vendor = "Amazon AWS"
-				osType = "AWS Cloud"
-			case strings.Contains(lowerHost, "akamai"):
-				vendor = "Akamai CDN"
-				osType = "Akamai CDN"
-			case strings.Contains(lowerHost, "azure"):
-				vendor = "Microsoft Azure"
-				osType = "Azure Cloud"
-			case strings.Contains(lowerHost, "facebook") || strings.Contains(lowerHost, "fbcdn"):
-				vendor = "Meta/Facebook"
-				osType = "Meta CDN"
-			case strings.Contains(lowerHost, "apple"):
-				vendor = "Apple"
-				osType = "Apple CDN"
-			}
-
-			s.Results <- Device{
-				IP:       ipStr,
-				MAC:      "public-wan",
-				Hostname: hostname,
-				Vendor:   vendor,
-				OS:       osType,
-			}
-
-			// TCP SYN probe: port 80 and 443 (300ms timeout)
-			go s.tcpProbePublicIP(ipStr)
+			// ═══ NEW PUBLIC IP FOUND — launch async worker goroutine ═══
+			// This ensures the sniffer loop is never blocked by DNS/TCP.
+			go s.analyzePublicIP(ipStr)
 		}
 	}
+}
+
+// analyzePublicIP is an async worker that performs deep analysis on a
+// single public IP: reverse DNS lookup, CDN detection, and TCP probe.
+// It sends 1-2 Device results to s.Results as data becomes available.
+func (s *Scanner) analyzePublicIP(ip string) {
+	// Step 1: Aggressive Reverse DNS (PTR record) — may take 1-2 seconds
+	hostname := ""
+	names, err := net.LookupAddr(ip)
+	if err == nil && len(names) > 0 {
+		hostname = strings.TrimSuffix(names[0], ".")
+	}
+
+	// Step 2: CDN/Cloud detection from hostname patterns
+	vendor := "Public IP"
+	osType := "WAN Device"
+	lowerHost := strings.ToLower(hostname)
+	switch {
+	case strings.Contains(lowerHost, "google") || strings.Contains(lowerHost, "gstatic") || strings.Contains(lowerHost, "1e100"):
+		vendor = "Google/CDN"
+		osType = "Google CDN"
+	case strings.Contains(lowerHost, "cloudflare"):
+		vendor = "Cloudflare"
+		osType = "Cloudflare CDN"
+	case strings.Contains(lowerHost, "amazonaws") || strings.Contains(lowerHost, "aws"):
+		vendor = "Amazon AWS"
+		osType = "AWS Cloud"
+	case strings.Contains(lowerHost, "akamai"):
+		vendor = "Akamai CDN"
+		osType = "Akamai CDN"
+	case strings.Contains(lowerHost, "azure"):
+		vendor = "Microsoft Azure"
+		osType = "Azure Cloud"
+	case strings.Contains(lowerHost, "facebook") || strings.Contains(lowerHost, "fbcdn"):
+		vendor = "Meta/Facebook"
+		osType = "Meta CDN"
+	case strings.Contains(lowerHost, "apple"):
+		vendor = "Apple"
+		osType = "Apple CDN"
+	}
+
+	// Step 3: Send initial result (with hostname) — updates TUI row 1
+	select {
+	case <-s.done:
+		return
+	case s.Results <- Device{
+		IP:       ip,
+		MAC:      "public-wan",
+		Hostname: hostname,
+		Vendor:   vendor,
+		OS:       osType,
+	}:
+	}
+
+	// Step 4: TCP probe port 443 then 80 (300ms timeout each)
+	// If a port is open, sends a SECOND result that updates the row
+	s.tcpProbePublicIP(ip)
 }
 
 // tcpProbePublicIP does a lightning-fast TCP connect scan on a public IP.
