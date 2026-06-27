@@ -542,6 +542,9 @@ func (s *Scanner) StartPassive() error {
 		return fmt.Errorf("failed to open pcap (need Administrator/Npcap?): %v", err)
 	}
 
+	// BPF: capture ALL IPv4 traffic (TCP, UDP, ICMP, QUIC, etc.)
+	handle.SetBPFFilter("ip")
+
 	// Best-effort: find local MAC so we can filter out our own packets.
 	// If we can't find it (no IP), use an empty MAC — passiveSniff will
 	// simply not filter anything, which is fine.
@@ -593,6 +596,11 @@ func (s *Scanner) StartExternalScan(ifaceName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open pcap: %v", err)
 	}
+
+	// ═══ BPF FILTER: "ip" = capture ALL IPv4 traffic ═══
+	// This ensures TCP, UDP (QUIC/HTTP3), ICMP — everything is captured.
+	// Without this, some pcap drivers default to only TCP.
+	handle.SetBPFFilter("ip")
 
 	// Find local IP and MAC
 	devs, err := pcap.FindAllDevs()
@@ -967,12 +975,18 @@ func IsPublicIP(ip net.IP) bool {
 	return true
 }
 
-// passivePublicIPHarvester sniffs all IPv4 traffic and harvests public IPs.
+// passivePublicIPHarvester sniffs ALL IPv4 traffic and harvests public IPs.
+// It operates at Layer 3 (IP level) — completely protocol-agnostic.
+// TCP, UDP (QUIC/HTTP3), ICMP — all are captured and checked.
+//
 // For each NEW public IP discovered (src or dst), it immediately launches
 // an async goroutine to perform reverse DNS + CDN detection + TCP probe.
-// Results are sent to s.Results channel as they become available.
+// Results are sent to s.Results channel as data becomes available.
 //
 // Uses sync.Map for lock-free concurrent IP deduplication.
+//
+// BPF filter "ip" must be set on the handle BEFORE calling this function
+// to ensure UDP/QUIC traffic (YouTube, Google) is not dropped by pcap.
 func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.HardwareAddr, seen *sync.Map) {
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for pkt := range packetSource.Packets() {
@@ -982,14 +996,16 @@ func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.Har
 		default:
 		}
 
-		// Must be IPv4
+		// ═══ LAYER 3: Extract IPs from IPv4 header ═══
+		// Protocol-agnostic: TCP, UDP (QUIC), ICMP — all go through here.
+		// Do NOT check for TCP/UDP layer — that would miss QUIC/UDP traffic.
 		ipLayer := pkt.Layer(layers.LayerTypeIPv4)
 		if ipLayer == nil {
-			continue
+			continue // not IPv4 (could be IPv6, ARP, etc.)
 		}
 		ipv4 := ipLayer.(*layers.IPv4)
 
-		// Extract both source and destination IPs
+		// Extract BOTH source and destination IPs
 		candidates := []net.IP{ipv4.SrcIP, ipv4.DstIP}
 
 		for _, ip := range candidates {
