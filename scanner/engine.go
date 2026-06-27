@@ -598,10 +598,10 @@ func (s *Scanner) StartExternalScan(ifaceName string) error {
 		return fmt.Errorf("failed to open pcap: %v", err)
 	}
 
-	// ═══ BPF FILTER: "ip" = capture ALL IPv4 traffic ═══
-	// This ensures TCP, UDP (QUIC/HTTP3), ICMP — everything is captured.
-	// Without this, some pcap drivers default to only TCP.
-	handle.SetBPFFilter("ip")
+	// ═══ BPF FILTER: empty = capture ALL traffic ═══
+	// Dual-stack: IPv4 + IPv6, TCP, UDP (QUIC), ICMP, ARP.
+	// TikTok, YouTube, modern CDNs use IPv6 — must not be dropped.
+	handle.SetBPFFilter("")
 
 	// Find local IP and MAC
 	devs, err := pcap.FindAllDevs()

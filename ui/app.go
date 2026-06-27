@@ -64,7 +64,9 @@ type model struct {
 	portScanDone bool
 }
 
+// ── Channel Listener Messages ────────────────────────────────────────
 type DeviceFoundMsg scanner.Device
+type ScanChannelClosedMsg struct{} // channel closed — stop listening
 
 // ── Port Scanner Messages ──────────────────────────────────────────
 type PortResultMsg scanner.PortResult
@@ -139,9 +141,15 @@ func InitialModel() tea.Model {
 }
 
 // Goroutine bridge ke BubbleTea loop
+// Reads ONE device from channel. If channel is closed, returns
+// ScanChannelClosedMsg to stop the listener gracefully (no infinite loop).
 func waitForDevice(sub chan scanner.Device) tea.Cmd {
 	return func() tea.Msg {
-		return DeviceFoundMsg(<-sub)
+		d, ok := <-sub
+		if !ok {
+			return ScanChannelClosedMsg{}
+		}
+		return DeviceFoundMsg(d)
 	}
 }
 
@@ -411,6 +419,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.table.SetRows(rows)
 		return m, waitForDevice(m.scanner.Results)
+
+	case ScanChannelClosedMsg:
+		// Channel closed — scanner stopped. Stop listening.
+		m.logMessage = "Scan selesai. Tekan Esc untuk kembali ke menu."
+		return m, nil
 
 	case PortResultMsg:
 		r := scanner.PortResult(msg)
