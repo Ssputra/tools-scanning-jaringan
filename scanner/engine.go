@@ -37,6 +37,7 @@ type Scanner struct {
 	Results       chan Device
 	done          chan bool
 	ttlResolved   sync.Map // tracks IPs that received TTL response (key: IP string)
+	sniDomains    sync.Map // passive SNI cache: IP string → domain string
 }
 
 func NewScanner(ifaceName string, mode string) *Scanner {
@@ -1012,11 +1013,123 @@ func IsPublicIP(ip net.IP) bool {
 	return true
 }
 
+// extractSNI parses raw TCP payload to extract the SNI (Server Name Indication)
+// domain from a TLS Client Hello message. Returns empty string if not a valid
+// Client Hello or SNI not found.
+//
+// TLS Record Structure:
+//
+//	Byte 0:    Content Type (22 = Handshake)
+//	Byte 1-2:  Version
+//	Byte 3-4:  Length
+//	Byte 5:    Handshake Type (1 = Client Hello)
+//	Byte 6-8:  Handshake Length
+//	Byte 9-10: Client Version
+//	Byte 11-42: Random (32 bytes)
+//	...then Session ID, Cipher Suites, Compression, Extensions
+//	Extension Type 0x0000 = SNI
+func extractSNI(payload []byte) string {
+	if len(payload) < 44 {
+		return ""
+	}
+
+	// TLS Content Type must be 22 (Handshake)
+	if payload[0] != 22 {
+		return ""
+	}
+
+	// Handshake Type must be 1 (Client Hello)
+	if payload[5] != 1 {
+		return ""
+	}
+
+	// Skip: Random(32) = bytes 11-42, start at byte 43
+	pos := 43
+
+	// Session ID: variable length, first byte is length
+	if pos >= len(payload) {
+		return ""
+	}
+	sessionIDLen := int(payload[pos])
+	pos += 1 + sessionIDLen
+
+	// Cipher Suites: 2-byte length + suites
+	if pos+2 > len(payload) {
+		return ""
+	}
+	cipherSuitesLen := int(payload[pos])<<8 | int(payload[pos+1])
+	pos += 2 + cipherSuitesLen
+
+	// Compression Methods: 1-byte length + methods
+	if pos >= len(payload) {
+		return ""
+	}
+	compressionLen := int(payload[pos])
+	pos += 1 + compressionLen
+
+	// Extensions: 2-byte total length
+	if pos+2 > len(payload) {
+		return ""
+	}
+	extensionsLen := int(payload[pos])<<8 | int(payload[pos+1])
+	pos += 2
+	extensionsEnd := pos + extensionsLen
+
+	if extensionsEnd > len(payload) {
+		extensionsEnd = len(payload)
+	}
+
+	// Walk extensions to find SNI (type 0x0000)
+	for pos+4 <= extensionsEnd {
+		extType := int(payload[pos])<<8 | int(payload[pos+1])
+		extLen := int(payload[pos+2])<<8 | int(payload[pos+3])
+		pos += 4
+
+		if extType == 0 { // SNI extension
+			// SNI: 2-byte list length, then each entry:
+			//   1 byte: name type (0 = hostname)
+			//   2 bytes: name length
+			//   N bytes: name
+			if pos+2 > extensionsEnd {
+				return ""
+			}
+			sniListLen := int(payload[pos])<<8 | int(payload[pos+1])
+			pos += 2
+			sniListEnd := pos + sniListLen
+			if sniListEnd > extensionsEnd {
+				sniListEnd = extensionsEnd
+			}
+
+			for pos+3 <= sniListEnd {
+				nameType := payload[pos]
+				nameLen := int(payload[pos+1])<<8 | int(payload[pos+2])
+				pos += 3
+
+				if nameType == 0 && nameLen > 0 && pos+nameLen <= sniListEnd {
+					domain := string(payload[pos : pos+nameLen])
+					if len(domain) > 0 {
+						return domain
+					}
+				}
+				pos += nameLen
+			}
+			return "" // SNI extension found but no hostname
+		}
+
+		pos += extLen
+	}
+
+	return "" // no SNI extension found
+}
+
 // passivePublicIPHarvester sniffs ALL traffic (IPv4 + IPv6) and harvests public IPs.
 // Dual-stack: captures both IPv4 and IPv6 packets from YouTube/Google/etc.
 //
 // Anti-self-log: compares each packet's srcIP/dstIP against localIP to
 // ensure the laptop's own IP is NEVER registered as a WAN target.
+//
+// SNI Extraction: TCP packets to port 443 (TLS) are parsed for Client Hello
+// SNI fields. The domain is cached in sniDomains for use as hostname fallback.
 //
 // For each NEW public IP discovered, launches async worker goroutine.
 // Uses sync.Map for lock-free concurrent IP deduplication.
@@ -1082,7 +1195,21 @@ func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.Har
 
 		ipStr := targetPublicIP.String()
 
-		// Lock-free deduplication
+		// ═══ PASSIVE SNI EXTRACTION ═══
+		// For TCP packets to port 443, parse TLS Client Hello for SNI.
+		// This runs for EVERY packet (even already-seen IPs) to keep
+		// the SNI cache fresh — the same IP may serve multiple domains.
+		tcpLayer := pkt.Layer(layers.LayerTypeTCP)
+		if tcpLayer != nil {
+			tcp := tcpLayer.(*layers.TCP)
+			if tcp.DstPort == 443 && len(tcp.Payload) > 0 {
+				if domain := extractSNI(tcp.Payload); domain != "" {
+					s.sniDomains.Store(ipStr, domain)
+				}
+			}
+		}
+
+		// Lock-free deduplication — skip analyzePublicIP for already-seen IPs
 		if _, loaded := seen.LoadOrStore(ipStr, true); loaded {
 			continue
 		}
@@ -1093,14 +1220,31 @@ func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.Har
 }
 
 // analyzePublicIP is an async worker that performs deep analysis on a
-// single public IP: reverse DNS lookup, CDN detection, and TCP probe.
+// single public IP: reverse DNS lookup, SNI domain, CDN detection, and TCP probe.
 // It sends 1-2 Device results to s.Results as data becomes available.
+//
+// HOSTNAME WATERFALL (priority order):
+//  1. rDNS (PTR record) — most reliable for well-known IPs
+//  2. SNI (passive TLS Client Hello) — captured from live traffic
+//  3. TLS cert SAN — only if rDNS + SNI both fail
+//  4. HTTP title — last resort
 //
 // STRICT TIMEOUT: GetAggressiveWANHostname completes within 2s max.
 // tcpProbePublicIP checks port 53 (DNS) FIRST — if open, label wins.
 func (s *Scanner) analyzePublicIP(ip string) {
+	// ═══ CHECK SNI CACHE FIRST (instant, no network) ═══
+	var sniDomain string
+	if val, ok := s.sniDomains.Load(ip); ok {
+		sniDomain = val.(string)
+	}
+
 	// ═══ HOSTNAME DETECTION (max 2s) ═══
 	hostname := GetAggressiveWANHostname(ip)
+
+	// ═══ FALLBACK: SNI if rDNS/TLS/HTTP all failed ═══
+	if hostname == "" && sniDomain != "" {
+		hostname = sniDomain
+	}
 
 	// CDN/Cloud detection from hostname patterns
 	vendor := "Public IP"
