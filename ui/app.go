@@ -164,6 +164,26 @@ func waitForPortResult(ch <-chan scanner.PortResult) tea.Cmd {
 	}
 }
 
+// ResetTableState clears ALL table data and stops any active scanner.
+// Must be called on every mode/scan transition to prevent ghost data.
+func (m *model) ResetTableState() {
+	// Stop any running scanner (kills goroutines, closes handle)
+	if m.scanner != nil {
+		m.scanner.Stop()
+		m.scanner = nil
+	}
+
+	// Clear device data + table rows
+	m.devices = make(map[string]scanner.Device)
+	m.table.SetRows(nil)
+
+	// Clear port scan data
+	m.portResults = nil
+	m.portTable.SetRows(nil)
+	m.portChan = nil
+	m.portScanDone = false
+}
+
 func (m model) Init() tea.Cmd {
 	return nil
 }
@@ -225,35 +245,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case stateSelectMode:
 				// Root menu — do nothing (or quit)
 			case stateSelectIface:
+				m.ResetTableState()
 				m.state = stateSelectMode
 				m.logMessage = "Pilih mode scanning untuk memulai."
 				return m, nil
 			case stateScanning:
-				if m.scanner != nil {
-					m.scanner.Stop()
-				}
+				m.ResetTableState()
 				m.state = stateSelectIface
 				m.logMessage = "Pilih interface jaringan."
 				return m, nil
 			case stateInputPortIP:
+				m.ResetTableState()
 				m.state = stateSelectMode
 				m.logMessage = "Pilih mode scanning untuk memulai."
 				m.portInput.SetValue("")
 				return m, nil
 			case statePortScanning:
+				m.ResetTableState()
 				m.state = stateInputPortIP
 				m.portInput.Focus()
 				m.logMessage = "Masukkan IP target untuk port scan."
-				m.portChan = nil
 				return m, nil
 			}
 		}
 
 		// Quit from anywhere
 		if key == "ctrl+c" || key == "q" {
-			if m.scanner != nil {
-				m.scanner.Stop()
-			}
+			m.ResetTableState()
 			return m, tea.Quit
 		}
 
@@ -327,6 +345,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter", "s":
 			switch m.state {
 			case stateSelectMode:
+				m.ResetTableState() // clear any leftover data from previous mode
 				if m.modeCursor == modePortScanner {
 					m.scanMode = modePortScanner
 					m.state = stateInputPortIP
@@ -350,6 +369,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case stateSelectIface:
 				if len(m.interfaces) > 0 {
+					m.ResetTableState() // clear previous scan data before starting new one
 					m.state = stateScanning
 					selectedIface := m.interfaces[m.cursor]
 
