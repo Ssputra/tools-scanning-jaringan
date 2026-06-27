@@ -195,9 +195,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		newCols := []table.Column{
 			{Title: "IP Address", Width: int(float32(availColWidth) * 0.15)},
 			{Title: "MAC Address", Width: int(float32(availColWidth) * 0.15)},
-			{Title: "Hostname", Width: int(float32(availColWidth) * 0.30)},
+			{Title: "Hostname", Width: int(float32(availColWidth) * 0.20)},
 			{Title: "Vendor", Width: int(float32(availColWidth) * 0.20)},
-			{Title: "Estimated OS", Width: int(float32(availColWidth) * 0.20)},
+			{Title: "Estimated OS", Width: int(float32(availColWidth) * 0.30)},
 		}
 		for i := range newCols {
 			if newCols[i].Width < 8 {
