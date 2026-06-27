@@ -1088,6 +1088,16 @@ func (s *Scanner) analyzePublicIP(ip string) {
 //
 // Returns the best hostname found, or empty string if all fail.
 func GetAggressiveWANHostname(ip string) string {
+	// ═══ Sanity Check: blacklist of invalid TLS cert names ═══
+	// Google LB returns "invalid2.invalid", Windows returns "localhost", etc.
+	tlsBlacklist := map[string]bool{
+		"invalid2.invalid": true,
+		"invalid":          true,
+		"localhost":        true,
+		"127.0.0.1":        true,
+		"":                 true,
+	}
+
 	type result struct {
 		source string
 		name   string
@@ -1116,12 +1126,10 @@ func GetAggressiveWANHostname(ip string) string {
 	}()
 
 	// ── Stage 2: TLS Certificate Extraction — 1s timeout ──
-	// This is the WEAPON: connects to port 443, reads the TLS cert's
-	// Subject Alternative Names (SAN). Much more accurate than rDNS.
 	go func() {
 		dialer := &net.Dialer{Timeout: 1 * time.Second}
 		tlsCfg := &tls.Config{
-			InsecureSkipVerify: true, // we're connecting to raw IP
+			InsecureSkipVerify: true,
 		}
 		conn, err := tls.DialWithDialer(dialer, "tcp", ip+":443", tlsCfg)
 		if err != nil {
@@ -1136,31 +1144,53 @@ func GetAggressiveWANHostname(ip string) string {
 
 		cert := state.PeerCertificates[0]
 
-		// Priority: DNSNames (SAN) > CommonName
+		// Pick the best name from SAN or CommonName
+		var rawName string
 		if len(cert.DNSNames) > 0 {
-			// Pick the most descriptive name (skip wildcard if exact exists)
-			bestName := cert.DNSNames[0]
+			rawName = cert.DNSNames[0]
 			for _, name := range cert.DNSNames {
 				if !strings.Contains(name, "*") {
-					bestName = name
+					rawName = name
 					break
 				}
 			}
-			ch <- result{"TLS", bestName}
 		} else if cert.Subject.CommonName != "" {
-			ch <- result{"TLS", cert.Subject.CommonName}
+			rawName = cert.Subject.CommonName
 		}
+
+		if rawName == "" {
+			return
+		}
+
+		// ═══ SANITY CHECK: validate TLS result before sending ═══
+		lower := strings.ToLower(strings.TrimSpace(rawName))
+
+		// Reject blacklisted names
+		if tlsBlacklist[lower] {
+			return
+		}
+
+		// Must contain a dot (real domain), reject garbage
+		if !strings.Contains(lower, ".") {
+			return
+		}
+
+		// Reject IP addresses masquerading as hostnames
+		if ip == lower {
+			return
+		}
+
+		// Looks valid — send it
+		ch <- result{"TLS", rawName}
 	}()
 
 	// ── Stage 3: HTTP <title> Scraper — 1s timeout ──
-	// Fallback: if rDNS and TLS both fail, try HTTP.
 	go func() {
 		client := &http.Client{
 			Timeout: 1 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			},
-			// Never follow redirects — we just want the title
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -1171,7 +1201,6 @@ func GetAggressiveWANHostname(ip string) string {
 		}
 		defer resp.Body.Close()
 
-		// Read first 4KB only (enough to find <title>)
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if err != nil {
 			return
@@ -1192,28 +1221,42 @@ func GetAggressiveWANHostname(ip string) string {
 		}
 	}()
 
-	// ── Collect results: wait up to 2.5s for best result ──
-	// TLS cert is most accurate, so it overrides rDNS if both arrive.
-	var bestResult result
+	// ── Collect results: rDNS is primary, TLS overrides only if valid ──
+	var rdnsResult result
+	var tlsResult result
+	var httpResult result
 	deadline := time.After(2500 * time.Millisecond)
 	received := 0
 	for received < 3 {
 		select {
 		case r := <-ch:
 			received++
-			// TLS always wins (most accurate service identification)
-			if r.source == "TLS" {
-				return r.name
-			}
-			// Keep the first non-TLS result as fallback
-			if bestResult.name == "" {
-				bestResult = r
+			switch r.source {
+			case "rDNS":
+				rdnsResult = r
+			case "TLS":
+				tlsResult = r
+			case "HTTP":
+				httpResult = r
 			}
 		case <-deadline:
-			return bestResult.name
+			break
 		}
 	}
-	return bestResult.name
+
+	// ═══ WATERFALL PRIORITY: rDNS → TLS (if valid) → HTTP ═══
+	// rDNS is the primary source (e.g. "dns.google", "something.1e100.net")
+	// TLS overrides ONLY if it's a valid domain (not blacklisted)
+	if rdnsResult.name != "" {
+		return rdnsResult.name
+	}
+	if tlsResult.name != "" {
+		return tlsResult.name
+	}
+	if httpResult.name != "" {
+		return httpResult.name
+	}
+	return ""
 }
 
 // tcpProbePublicIP does a lightning-fast TCP connect scan on a public IP.
