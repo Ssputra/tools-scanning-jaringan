@@ -542,8 +542,9 @@ func (s *Scanner) StartPassive() error {
 		return fmt.Errorf("failed to open pcap (need Administrator/Npcap?): %v", err)
 	}
 
-	// BPF: capture ALL IPv4 traffic (TCP, UDP, ICMP, QUIC, etc.)
-	handle.SetBPFFilter("ip")
+	// BPF: empty — capture ALL traffic (IPv4 + IPv6, TCP, UDP, ICMP, QUIC, ARP)
+	// Dual-stack support requires no filter so IPv6 packets are not dropped.
+	handle.SetBPFFilter("")
 
 	// Best-effort: find local MAC so we can filter out our own packets.
 	// If we can't find it (no IP), use an empty MAC — passiveSniff will
@@ -663,10 +664,10 @@ func (s *Scanner) StartExternalScan(ifaceName string) error {
 		defer handle.Close()
 
 		// --- Phase 0: Passive Public-IP Harvester (runs continuously) ---
-		// Sniffs ALL traffic, extracts public IPs from SrcIP/DstIP,
-		// launches async goroutine per IP for reverse DNS + TCP probe.
+		// Sniffs ALL traffic (IPv4+IPv6), extracts public IPs from SrcIP/DstIP,
+		// excludes localIP to prevent self-detection.
 		var seenPublicIPs sync.Map
-		go s.passivePublicIPHarvester(handle, srcMAC, &seenPublicIPs)
+		go s.passivePublicIPHarvester(handle, srcMAC, srcIP, &seenPublicIPs)
 
 		// Track discovered hops to avoid duplicates
 		seenHops := make(map[string]bool)
@@ -934,12 +935,41 @@ func (s *Scanner) startTTLTimeout(ip string, timeout time.Duration) {
 }
 
 // IsPublicIP returns true if the IP is a routable public address.
-// It filters out private ranges (RFC 1918), loopback, link-local, and APIPA.
+// Supports both IPv4 and IPv6. Filters out private, loopback, link-local.
 func IsPublicIP(ip net.IP) bool {
-	ip = ip.To4()
 	if ip == nil {
 		return false
 	}
+
+	// ═══ IPv6 ═══
+	if ip4 := ip.To4(); ip4 == nil {
+		// It's IPv6 — check for non-public ranges
+		if ip.IsLoopback() {
+			return false
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return false
+		}
+		if ip.IsMulticast() {
+			return false
+		}
+		// fe80::/10 = link-local
+		if ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
+			return false
+		}
+		// ::1 = loopback
+		if ip.IsLoopback() {
+			return false
+		}
+		// fc00::/7 = ULA (Unique Local Address)
+		if ip[0] == 0xfc || ip[0] == 0xfd {
+			return false
+		}
+		return true
+	}
+
+	// ═══ IPv4 ═══
+	ip = ip.To4()
 	// Loopback: 127.0.0.0/8
 	if ip[0] == 127 {
 		return false
@@ -975,19 +1005,15 @@ func IsPublicIP(ip net.IP) bool {
 	return true
 }
 
-// passivePublicIPHarvester sniffs ALL IPv4 traffic and harvests public IPs.
-// It operates at Layer 3 (IP level) — completely protocol-agnostic.
-// TCP, UDP (QUIC/HTTP3), ICMP — all are captured and checked.
+// passivePublicIPHarvester sniffs ALL traffic (IPv4 + IPv6) and harvests public IPs.
+// Dual-stack: captures both IPv4 and IPv6 packets from YouTube/Google/etc.
 //
-// For each NEW public IP discovered (src or dst), it immediately launches
-// an async goroutine to perform reverse DNS + CDN detection + TCP probe.
-// Results are sent to s.Results channel as data becomes available.
+// Anti-self-log: compares each packet's srcIP/dstIP against localIP to
+// ensure the laptop's own IP is NEVER registered as a WAN target.
 //
+// For each NEW public IP discovered, launches async worker goroutine.
 // Uses sync.Map for lock-free concurrent IP deduplication.
-//
-// BPF filter "ip" must be set on the handle BEFORE calling this function
-// to ensure UDP/QUIC traffic (YouTube, Google) is not dropped by pcap.
-func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.HardwareAddr, seen *sync.Map) {
+func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.HardwareAddr, localIP net.IP, seen *sync.Map) {
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for pkt := range packetSource.Packets() {
 		select {
@@ -996,34 +1022,66 @@ func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.Har
 		default:
 		}
 
-		// ═══ LAYER 3: Extract IPs from IPv4 header ═══
-		// Protocol-agnostic: TCP, UDP (QUIC), ICMP — all go through here.
-		// Do NOT check for TCP/UDP layer — that would miss QUIC/UDP traffic.
-		ipLayer := pkt.Layer(layers.LayerTypeIPv4)
-		if ipLayer == nil {
-			continue // not IPv4 (could be IPv6, ARP, etc.)
+		// ═══ DUAL-STACK: Extract IPs from IPv4 OR IPv6 header ═══
+		var srcIP, dstIP net.IP
+
+		ipv4Layer := pkt.Layer(layers.LayerTypeIPv4)
+		if ipv4Layer != nil {
+			ipv4 := ipv4Layer.(*layers.IPv4)
+			srcIP = ipv4.SrcIP
+			dstIP = ipv4.DstIP
 		}
-		ipv4 := ipLayer.(*layers.IPv4)
 
-		// Extract BOTH source and destination IPs
-		candidates := []net.IP{ipv4.SrcIP, ipv4.DstIP}
-
-		for _, ip := range candidates {
-			if ip == nil || !IsPublicIP(ip) {
-				continue
-			}
-
-			ipStr := ip.String()
-
-			// Lock-free deduplication: LoadOrStore atomically checks + registers
-			if _, loaded := seen.LoadOrStore(ipStr, true); loaded {
-				continue // already being processed
-			}
-
-			// ═══ NEW PUBLIC IP FOUND — launch async worker goroutine ═══
-			// This ensures the sniffer loop is never blocked by DNS/TCP.
-			go s.analyzePublicIP(ipStr)
+		ipv6Layer := pkt.Layer(layers.LayerTypeIPv6)
+		if ipv6Layer != nil {
+			ipv6 := ipv6Layer.(*layers.IPv6)
+			srcIP = ipv6.SrcIP
+			dstIP = ipv6.DstIP
 		}
+
+		// Skip non-IP packets (ARP, etc.)
+		if srcIP == nil || dstIP == nil {
+			continue
+		}
+
+		// ═══ ANTI-SELF-LOG: Never register our own localIP ═══
+		// Determine which IP is the remote public target:
+		//   - If src is public AND dst is us → src is the remote target
+		//   - If dst is public AND src is us → dst is the remote target
+		//   - Otherwise: skip (internal traffic or both private)
+		var targetPublicIP net.IP
+
+		if IsPublicIP(srcIP) && dstIP.Equal(localIP) {
+			// Incoming traffic from external → src is the public target
+			targetPublicIP = srcIP
+		} else if IsPublicIP(dstIP) && srcIP.Equal(localIP) {
+			// Outgoing traffic to external → dst is the public target
+			targetPublicIP = dstIP
+		} else if IsPublicIP(srcIP) && !srcIP.Equal(localIP) {
+			// Both IPs are public (transit traffic) — use src
+			targetPublicIP = srcIP
+		} else if IsPublicIP(dstIP) && !dstIP.Equal(localIP) {
+			targetPublicIP = dstIP
+		}
+
+		if targetPublicIP == nil {
+			continue // no public IP found, or traffic is local-only
+		}
+
+		// Skip if target is somehow our own local IP (double safety)
+		if targetPublicIP.Equal(localIP) {
+			continue
+		}
+
+		ipStr := targetPublicIP.String()
+
+		// Lock-free deduplication
+		if _, loaded := seen.LoadOrStore(ipStr, true); loaded {
+			continue
+		}
+
+		// ═══ NEW PUBLIC IP FOUND — launch async worker ═══
+		go s.analyzePublicIP(ipStr)
 	}
 }
 
