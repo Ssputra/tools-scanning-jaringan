@@ -1088,9 +1088,11 @@ func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.Har
 // analyzePublicIP is an async worker that performs deep analysis on a
 // single public IP: reverse DNS lookup, CDN detection, and TCP probe.
 // It sends 1-2 Device results to s.Results as data becomes available.
+//
+// STRICT TIMEOUT: GetAggressiveWANHostname completes within 2s max.
+// tcpProbePublicIP checks port 53 (DNS) FIRST — if open, label wins.
 func (s *Scanner) analyzePublicIP(ip string) {
-	// ═══ SUPER AGGRESSIVE HOSTNAME DETECTION ═══
-	// Waterfall: rDNS (500ms) → TLS Cert (1s) → HTTP Title (1s)
+	// ═══ HOSTNAME DETECTION (max 2s) ═══
 	hostname := GetAggressiveWANHostname(ip)
 
 	// CDN/Cloud detection from hostname patterns
@@ -1138,16 +1140,18 @@ func (s *Scanner) analyzePublicIP(ip string) {
 	s.tcpProbePublicIP(ip)
 }
 
-// GetAggressiveWANHostname performs a 3-stage waterfall hostname detection:
+// GetAggressiveWANHostname performs a 3-stage waterfall hostname detection.
 //
-//	Stage 1: Reverse DNS (PTR) — fast, 1000ms timeout
-//	Stage 2: TLS Certificate extraction — accurate, 1000ms timeout
-//	Stage 3: HTTP <title> scraper — fallback, 1000ms timeout
+// STRICT TIMEOUT: The entire function completes within 2 seconds max.
+// Each stage has its own timeout, and the collect loop has a hard deadline.
+// If a target IP is a blackhole (no response), the worker moves on immediately.
+//
+//	Stage 1: Reverse DNS (PTR) — 800ms timeout
+//	Stage 2: TLS Certificate extraction — 1000ms timeout
+//	Stage 3: HTTP <title> scraper — 1000ms timeout
 //
 // Waterfall priority: rDNS (primary) → TLS (override if valid) → HTTP (fallback)
-// TLS only overrides rDNS if it passes blacklist + sanity checks.
 func GetAggressiveWANHostname(ip string) string {
-	// ═══ Sanity Check: blacklist of invalid TLS cert names ═══
 	tlsBlacklist := map[string]bool{
 		"invalid2.invalid": true,
 		"invalid":          true,
@@ -1163,7 +1167,7 @@ func GetAggressiveWANHostname(ip string) string {
 
 	ch := make(chan result, 3)
 
-	// ── Stage 1: Reverse DNS (PTR record) — 1000ms timeout ──
+	// ── Stage 1: Reverse DNS (PTR record) — 800ms timeout ──
 	go func() {
 		ctx := make(chan string, 1)
 		go func() {
@@ -1179,7 +1183,7 @@ func GetAggressiveWANHostname(ip string) string {
 			if name != "" {
 				ch <- result{"rDNS", name}
 			}
-		case <-time.After(1000 * time.Millisecond):
+		case <-time.After(800 * time.Millisecond):
 		}
 	}()
 
@@ -1202,7 +1206,6 @@ func GetAggressiveWANHostname(ip string) string {
 
 		cert := state.PeerCertificates[0]
 
-		// Pick the best name from SAN or CommonName
 		var rawName string
 		if len(cert.DNSNames) > 0 {
 			rawName = cert.DNSNames[0]
@@ -1220,25 +1223,17 @@ func GetAggressiveWANHostname(ip string) string {
 			return
 		}
 
-		// ═══ SANITY CHECK: validate TLS result before sending ═══
 		lower := strings.ToLower(strings.TrimSpace(rawName))
-
-		// Reject blacklisted names
 		if tlsBlacklist[lower] {
 			return
 		}
-
-		// Must contain a dot (real domain), reject garbage
 		if !strings.Contains(lower, ".") {
 			return
 		}
-
-		// Reject IP addresses masquerading as hostnames
 		if ip == lower {
 			return
 		}
 
-		// Looks valid — send it
 		ch <- result{"TLS", rawName}
 	}()
 
@@ -1279,10 +1274,11 @@ func GetAggressiveWANHostname(ip string) string {
 		}
 	}()
 
-	// ═══ COLLECT: wait up to 2500ms for all 3 goroutines ═══
-	// Uses labeled for+select to properly break out of loop on deadline.
+	// ═══ COLLECT: HARD DEADLINE 2000ms ═══
+	// Labeled break ensures we exit the for loop on deadline.
+	// No goroutine can keep this function alive past 2s.
 	var rdnsResult, tlsResult, httpResult result
-	deadline := time.After(2500 * time.Millisecond)
+	deadline := time.After(2000 * time.Millisecond)
 	received := 0
 
 collect:
@@ -1303,9 +1299,7 @@ collect:
 		}
 	}
 
-	// ═══ WATERFALL PRIORITY: rDNS (primary) → TLS (if valid) → HTTP ═══
-	// rDNS is the primary source (e.g. "dns.google", "something.1e100.net")
-	// TLS overrides ONLY if it's a valid domain (not blacklisted)
+	// ═══ WATERFALL: rDNS (primary) → TLS (if valid) → HTTP (fallback) ═══
 	if rdnsResult.name != "" {
 		return rdnsResult.name
 	}
@@ -1319,32 +1313,60 @@ collect:
 }
 
 // tcpProbePublicIP does a lightning-fast TCP connect scan on a public IP.
-// If port 443 is open, it labels the device as "HTTPS / Web Server".
+// Port 53 (DNS) is checked FIRST — if open, label as "DNS Server"
+// with highest priority so port 443/80 results never overwrite it.
 func (s *Scanner) tcpProbePublicIP(ip string) {
-	timeout := 300 * time.Millisecond
+	timeout := 500 * time.Millisecond
 
-	// Try port 443 first (most important for CDN/web detection)
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "443"), timeout)
+	// ═══ Priority 1: Port 53 (DNS) — highest priority label ═══
+	// DNS servers like 8.8.8.8, 1.1.1.1 also open port 443,
+	// but their PRIMARY function is DNS. Check this first.
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "53"), timeout)
 	if err == nil {
 		conn.Close()
-		s.Results <- Device{
+		select {
+		case <-s.done:
+			return
+		case s.Results <- Device{
+			IP:     ip,
+			MAC:    "public-wan",
+			Vendor: "DNS Server",
+			OS:     "DNS Server (port 53 open)",
+		}:
+		}
+		return // DNS label wins — do NOT check port 443/80
+	}
+
+	// ═══ Priority 2: Port 443 (HTTPS) ═══
+	conn, err = net.DialTimeout("tcp", net.JoinHostPort(ip, "443"), timeout)
+	if err == nil {
+		conn.Close()
+		select {
+		case <-s.done:
+			return
+		case s.Results <- Device{
 			IP:     ip,
 			MAC:    "public-wan",
 			Vendor: "HTTPS / Web Server",
 			OS:     "Web Server (port 443 open)",
+		}:
 		}
 		return
 	}
 
-	// Try port 80
+	// ═══ Priority 3: Port 80 (HTTP) ═══
 	conn, err = net.DialTimeout("tcp", net.JoinHostPort(ip, "80"), timeout)
 	if err == nil {
 		conn.Close()
-		s.Results <- Device{
+		select {
+		case <-s.done:
+			return
+		case s.Results <- Device{
 			IP:     ip,
 			MAC:    "public-wan",
 			Vendor: "HTTP / Web Server",
 			OS:     "Web Server (port 80 open)",
+		}:
 		}
 	}
 }
