@@ -1,8 +1,11 @@
 package scanner
 
 import (
+	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -1012,14 +1015,11 @@ func (s *Scanner) passivePublicIPHarvester(handle *pcap.Handle, localMAC net.Har
 // single public IP: reverse DNS lookup, CDN detection, and TCP probe.
 // It sends 1-2 Device results to s.Results as data becomes available.
 func (s *Scanner) analyzePublicIP(ip string) {
-	// Step 1: Aggressive Reverse DNS (PTR record) — may take 1-2 seconds
-	hostname := ""
-	names, err := net.LookupAddr(ip)
-	if err == nil && len(names) > 0 {
-		hostname = strings.TrimSuffix(names[0], ".")
-	}
+	// ═══ SUPER AGGRESSIVE HOSTNAME DETECTION ═══
+	// Waterfall: rDNS (500ms) → TLS Cert (1s) → HTTP Title (1s)
+	hostname := GetAggressiveWANHostname(ip)
 
-	// Step 2: CDN/Cloud detection from hostname patterns
+	// CDN/Cloud detection from hostname patterns
 	vendor := "Public IP"
 	osType := "WAN Device"
 	lowerHost := strings.ToLower(hostname)
@@ -1047,7 +1047,7 @@ func (s *Scanner) analyzePublicIP(ip string) {
 		osType = "Apple CDN"
 	}
 
-	// Step 3: Send initial result (with hostname) — updates TUI row 1
+	// Send result (with hostname) — updates TUI row
 	select {
 	case <-s.done:
 		return
@@ -1060,9 +1060,144 @@ func (s *Scanner) analyzePublicIP(ip string) {
 	}:
 	}
 
-	// Step 4: TCP probe port 443 then 80 (300ms timeout each)
-	// If a port is open, sends a SECOND result that updates the row
+	// TCP probe port 443 then 80 (300ms timeout each)
 	s.tcpProbePublicIP(ip)
+}
+
+// GetAggressiveWANHostname performs a 3-stage waterfall hostname detection:
+//
+//	Stage 1: Reverse DNS (PTR) — fast, 500ms timeout
+//	Stage 2: TLS Certificate extraction — most accurate, 1s timeout
+//	Stage 3: HTTP <title> scraper — fallback, 1s timeout
+//
+// Returns the best hostname found, or empty string if all fail.
+func GetAggressiveWANHostname(ip string) string {
+	type result struct {
+		source string
+		name   string
+	}
+
+	ch := make(chan result, 3)
+
+	// ── Stage 1: Reverse DNS (PTR record) — 500ms timeout ──
+	go func() {
+		ctx := make(chan string, 1)
+		go func() {
+			names, err := net.LookupAddr(ip)
+			if err == nil && len(names) > 0 {
+				ctx <- strings.TrimSuffix(names[0], ".")
+			} else {
+				ctx <- ""
+			}
+		}()
+		select {
+		case name := <-ctx:
+			if name != "" {
+				ch <- result{"rDNS", name}
+			}
+		case <-time.After(500 * time.Millisecond):
+		}
+	}()
+
+	// ── Stage 2: TLS Certificate Extraction — 1s timeout ──
+	// This is the WEAPON: connects to port 443, reads the TLS cert's
+	// Subject Alternative Names (SAN). Much more accurate than rDNS.
+	go func() {
+		dialer := &net.Dialer{Timeout: 1 * time.Second}
+		tlsCfg := &tls.Config{
+			InsecureSkipVerify: true, // we're connecting to raw IP
+		}
+		conn, err := tls.DialWithDialer(dialer, "tcp", ip+":443", tlsCfg)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		state := conn.ConnectionState()
+		if len(state.PeerCertificates) == 0 {
+			return
+		}
+
+		cert := state.PeerCertificates[0]
+
+		// Priority: DNSNames (SAN) > CommonName
+		if len(cert.DNSNames) > 0 {
+			// Pick the most descriptive name (skip wildcard if exact exists)
+			bestName := cert.DNSNames[0]
+			for _, name := range cert.DNSNames {
+				if !strings.Contains(name, "*") {
+					bestName = name
+					break
+				}
+			}
+			ch <- result{"TLS", bestName}
+		} else if cert.Subject.CommonName != "" {
+			ch <- result{"TLS", cert.Subject.CommonName}
+		}
+	}()
+
+	// ── Stage 3: HTTP <title> Scraper — 1s timeout ──
+	// Fallback: if rDNS and TLS both fail, try HTTP.
+	go func() {
+		client := &http.Client{
+			Timeout: 1 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+			// Never follow redirects — we just want the title
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		resp, err := client.Get("http://" + ip)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		// Read first 4KB only (enough to find <title>)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if err != nil {
+			return
+		}
+
+		html := strings.ToLower(string(body))
+		start := strings.Index(html, "<title>")
+		if start == -1 {
+			return
+		}
+		end := strings.Index(html[start+7:], "</title>")
+		if end == -1 {
+			return
+		}
+		title := strings.TrimSpace(string(body[start+7 : start+7+end]))
+		if title != "" {
+			ch <- result{"HTTP", title}
+		}
+	}()
+
+	// ── Collect results: wait up to 2.5s for best result ──
+	// TLS cert is most accurate, so it overrides rDNS if both arrive.
+	var bestResult result
+	deadline := time.After(2500 * time.Millisecond)
+	received := 0
+	for received < 3 {
+		select {
+		case r := <-ch:
+			received++
+			// TLS always wins (most accurate service identification)
+			if r.source == "TLS" {
+				return r.name
+			}
+			// Keep the first non-TLS result as fallback
+			if bestResult.name == "" {
+				bestResult = r
+			}
+		case <-deadline:
+			return bestResult.name
+		}
+	}
+	return bestResult.name
 }
 
 // tcpProbePublicIP does a lightning-fast TCP connect scan on a public IP.
