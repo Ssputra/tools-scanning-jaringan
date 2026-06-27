@@ -43,7 +43,7 @@ func NewScanner(ifaceName string, mode string) *Scanner {
 	return &Scanner{
 		InterfaceName: ifaceName,
 		ScanMode:      mode,
-		Results:       make(chan Device, 100),
+		Results:       make(chan Device, 1000),
 		done:          make(chan bool),
 	}
 }
@@ -1140,14 +1140,14 @@ func (s *Scanner) analyzePublicIP(ip string) {
 
 // GetAggressiveWANHostname performs a 3-stage waterfall hostname detection:
 //
-//	Stage 1: Reverse DNS (PTR) — fast, 500ms timeout
-//	Stage 2: TLS Certificate extraction — most accurate, 1s timeout
-//	Stage 3: HTTP <title> scraper — fallback, 1s timeout
+//	Stage 1: Reverse DNS (PTR) — fast, 1000ms timeout
+//	Stage 2: TLS Certificate extraction — accurate, 1000ms timeout
+//	Stage 3: HTTP <title> scraper — fallback, 1000ms timeout
 //
-// Returns the best hostname found, or empty string if all fail.
+// Waterfall priority: rDNS (primary) → TLS (override if valid) → HTTP (fallback)
+// TLS only overrides rDNS if it passes blacklist + sanity checks.
 func GetAggressiveWANHostname(ip string) string {
 	// ═══ Sanity Check: blacklist of invalid TLS cert names ═══
-	// Google LB returns "invalid2.invalid", Windows returns "localhost", etc.
 	tlsBlacklist := map[string]bool{
 		"invalid2.invalid": true,
 		"invalid":          true,
@@ -1163,7 +1163,7 @@ func GetAggressiveWANHostname(ip string) string {
 
 	ch := make(chan result, 3)
 
-	// ── Stage 1: Reverse DNS (PTR record) — 500ms timeout ──
+	// ── Stage 1: Reverse DNS (PTR record) — 1000ms timeout ──
 	go func() {
 		ctx := make(chan string, 1)
 		go func() {
@@ -1179,11 +1179,11 @@ func GetAggressiveWANHostname(ip string) string {
 			if name != "" {
 				ch <- result{"rDNS", name}
 			}
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(1000 * time.Millisecond):
 		}
 	}()
 
-	// ── Stage 2: TLS Certificate Extraction — 1s timeout ──
+	// ── Stage 2: TLS Certificate Extraction — 1000ms timeout ──
 	go func() {
 		dialer := &net.Dialer{Timeout: 1 * time.Second}
 		tlsCfg := &tls.Config{
@@ -1242,7 +1242,7 @@ func GetAggressiveWANHostname(ip string) string {
 		ch <- result{"TLS", rawName}
 	}()
 
-	// ── Stage 3: HTTP <title> Scraper — 1s timeout ──
+	// ── Stage 3: HTTP <title> Scraper — 1000ms timeout ──
 	go func() {
 		client := &http.Client{
 			Timeout: 1 * time.Second,
@@ -1279,12 +1279,13 @@ func GetAggressiveWANHostname(ip string) string {
 		}
 	}()
 
-	// ── Collect results: rDNS is primary, TLS overrides only if valid ──
-	var rdnsResult result
-	var tlsResult result
-	var httpResult result
+	// ═══ COLLECT: wait up to 2500ms for all 3 goroutines ═══
+	// Uses labeled for+select to properly break out of loop on deadline.
+	var rdnsResult, tlsResult, httpResult result
 	deadline := time.After(2500 * time.Millisecond)
 	received := 0
+
+collect:
 	for received < 3 {
 		select {
 		case r := <-ch:
@@ -1298,11 +1299,11 @@ func GetAggressiveWANHostname(ip string) string {
 				httpResult = r
 			}
 		case <-deadline:
-			break
+			break collect
 		}
 	}
 
-	// ═══ WATERFALL PRIORITY: rDNS → TLS (if valid) → HTTP ═══
+	// ═══ WATERFALL PRIORITY: rDNS (primary) → TLS (if valid) → HTTP ═══
 	// rDNS is the primary source (e.g. "dns.google", "something.1e100.net")
 	// TLS overrides ONLY if it's a valid domain (not blacklisted)
 	if rdnsResult.name != "" {
